@@ -59,28 +59,35 @@ std::once_flag g_ble_init_flag;
 SemaphoreHandle_t g_ble_mutex = nullptr;
 
 void initBleOnce() {
-    // Quiet NimBLE-Arduino's per-event log spam. Tags include the ".cpp"
-    // suffix because arduino-esp32's log_* macros derive the tag from
-    // pathToFileName(__FILE__). USE_ESP_IDF_LOG must be defined globally
-    // (see platformio.ini debug env) for these settings to take effect.
-    esp_log_level_set("NimBLEDevice.cpp",                ESP_LOG_INFO);
-    esp_log_level_set("NimBLEScan.cpp",                  ESP_LOG_INFO);
-    esp_log_level_set("NimBLEAdvertisedDevice.cpp",      ESP_LOG_WARN);
-    esp_log_level_set("NimBLEClient.cpp",                ESP_LOG_INFO);
-    esp_log_level_set("NimBLERemoteCharacteristic.cpp",  ESP_LOG_INFO);
-    esp_log_level_set("NimBLERemoteService.cpp",         ESP_LOG_INFO);
-    esp_log_level_set("NimBLEUtils.cpp",                 ESP_LOG_WARN);
-    esp_log_level_set("NimBLEAddress.cpp",               ESP_LOG_WARN);
-    esp_log_level_set("NimBLEUUID.cpp",                  ESP_LOG_WARN);
-    esp_log_level_set("NimBLE",                          ESP_LOG_WARN);
+    // Make our own log_i / log_d visible. With USE_ESP_IDF_LOG defined
+    // globally, log_* macros route through esp_log_write with tag
+    // "ARDUINO". Default ESP_LOG level for unset tags is WARN on
+    // arduino-esp32, so log_i and log_d were silently dropped, leaving
+    // us blind to the BLE bring-up sequence. Force ARDUINO tag to DEBUG.
+    esp_log_level_set("ARDUINO",                         ESP_LOG_DEBUG);
+
+    // Quiet NimBLE-Arduino's per-event log spam. Its sources tag with
+    // their own component names (no ".cpp" suffix in the NIMBLE_LOG_*
+    // path), so set a few common ones plus a "*" fallback at WARN.
+    esp_log_level_set("*",                               ESP_LOG_WARN);
+    esp_log_level_set("ARDUINO",                         ESP_LOG_DEBUG);  // re-apply after "*"
+    esp_log_level_set("NimBLEDevice",                    ESP_LOG_INFO);
+    esp_log_level_set("NimBLEClient",                    ESP_LOG_INFO);
+    esp_log_level_set("NimBLEScan",                      ESP_LOG_INFO);
 
     g_ble_mutex = xSemaphoreCreateMutex();
-    NimBLEDevice::init("GoGoVernier");
-    // Default ATT_MTU is 23 → max payload per write is 20 bytes. CMD_INIT
-    // is 25 bytes; the device drops the over-MTU write silently and we
-    // see it as a CMD_* timeout. Set the local preferred MTU to the NimBLE
-    // ceiling so the negotiated value is at least 28.
+
+    // Set the local preferred ATT MTU BEFORE NimBLEDevice::init so the
+    // value is in place when the host stack registers and the peer's
+    // first MTU REQUEST is responded to. Default ATT_MTU is 23 → max
+    // single-write payload is MTU-3 = 20 bytes, but CMD_INIT is 25 and
+    // h2zero's NimBLERemoteValueAttribute::writeValue truncates over-MTU
+    // writes to MTU-3 when the characteristic is WRITE_NO_RSP (long-
+    // write requires write-with-response, which the GDX cmd char does
+    // not advertise). The truncated frame is silently dropped by the
+    // peripheral and we time out waiting for the notify reply.
     NimBLEDevice::setMTU(247);
+    NimBLEDevice::init("GoGoVernier");
 }
 
 void ensureBleInited() {
@@ -246,21 +253,40 @@ bool NimBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
     }
     log_d("NimBLEClient connected");
 
-    // exchangeMTU is async inside h2zero. Poll getMTU() until it leaves
-    // the default 23 OR a short timeout fires. Service discovery + CMD_INIT
-    // both run on the negotiated MTU, so blocking briefly here avoids a
-    // first-write at MTU=23 that the peripheral silently drops.
+    // h2zero's exchangeMTU is async — connect() returns before the GATT
+    // exchange completes. Poll getMTU() until it climbs above the default
+    // 23, or fall back to a manual exchange + poll if the auto-exchange
+    // never landed. Without MTU >= 28, NimBLERemoteValueAttribute::
+    // writeValue truncates the 25-byte CMD_INIT to 20 bytes and the
+    // peripheral drops it.
     {
-        const TickType_t kStep = pdMS_TO_TICKS(20);
-        const TickType_t kMax  = pdMS_TO_TICKS(800);
+        const TickType_t kStep = pdMS_TO_TICKS(50);
+        const TickType_t kMax  = pdMS_TO_TICKS(2000);
         TickType_t waited = 0;
         while (_impl->client->getMTU() <= 23 && waited < kMax) {
             vTaskDelay(kStep);
             waited += kStep;
         }
-        log_i("MTU after settle = %u (waited %ums)",
-              (unsigned)_impl->client->getMTU(),
+        uint16_t mtu = _impl->client->getMTU();
+        if (mtu <= 23) {
+            log_w("MTU still %u after %ums — issuing manual exchangeMTU",
+                  (unsigned)mtu, (unsigned)pdTICKS_TO_MS(waited));
+            _impl->client->exchangeMTU();
+            // Poll again for up to another 1.5s.
+            waited = 0;
+            const TickType_t kMax2 = pdMS_TO_TICKS(1500);
+            while (_impl->client->getMTU() <= 23 && waited < kMax2) {
+                vTaskDelay(kStep);
+                waited += kStep;
+            }
+            mtu = _impl->client->getMTU();
+        }
+        log_i("MTU = %u (settle %ums)", (unsigned)mtu,
               (unsigned)pdTICKS_TO_MS(waited));
+        if (mtu < 28) {
+            log_e("MTU %u too small for 25-byte CMD_INIT — handshake will fail",
+                  (unsigned)mtu);
+        }
     }
 
     NimBLERemoteService* service = _impl->client->getService(svc);
