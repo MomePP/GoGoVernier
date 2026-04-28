@@ -8,6 +8,7 @@
 
 #include "GoGoVernier.h"
 
+#include <Arduino.h>
 #include <string.h>
 
 #include "transport/BundledBleXport.h"
@@ -38,14 +39,16 @@ bool GoGoVernier::open(const char* name) {
     if (_impl->connected) close();
 
     constexpr uint32_t kScanMs = 5000;
+    log_i("open name=\"%s\"", name ? name : "");
     if (!_impl->xport.connect(name, kScanMs)) {
+        log_e("open failed (no peer or connect rejected)");
         return false;
     }
 
     // Subscribe to the response characteristic. Phase 2 will plug a real
-    // D2PIO frame decoder into this callback; for now we just count bytes.
-    _impl->xport.subscribe([](const uint8_t* /*data*/, uint16_t /*len*/) {
-        // Phase-2 stub.
+    // D2PIO frame decoder into this callback; for now we just log frame size.
+    _impl->xport.subscribe([](const uint8_t* /*data*/, uint16_t len) {
+        log_v("notify rx len=%u", len);
     });
 
     // Cache what we already know without doing any protocol traffic.
@@ -64,6 +67,7 @@ bool GoGoVernier::open(const char* name) {
 }
 
 void GoGoVernier::close() {
+    log_i("close");
     _impl->xport.unsubscribe();
     _impl->xport.disconnect();
     _impl->connected     = false;

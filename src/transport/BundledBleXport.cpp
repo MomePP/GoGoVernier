@@ -161,42 +161,56 @@ bool BundledBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
     scan->setInterval(100);
     scan->setWindow(99);
 
-    // arduino-esp32 BLEScan uses seconds for timeout in start(). Normalise:
     uint32_t timeout_s = scan_timeout_ms ? (scan_timeout_ms + 999) / 1000 : 5;
+    log_i("scan start name=\"%s\" timeout=%us", name ? name : "", timeout_s);
     scan->start(timeout_s, /*is_continue=*/false);
     scan->stop();
     scan->clearResults();
 
     _impl->target = finder.take();
-    if (!_impl->target) return false;
+    if (!_impl->target) {
+        log_e("scan complete, no match");
+        return false;
+    }
 
     _impl->peer_addr = _impl->target->getAddress().toString().c_str();
     _impl->peer_name = _impl->target->haveName()
                            ? _impl->target->getName().c_str()
                            : "";
     _impl->cached_rssi = _impl->target->getRSSI();
+    log_i("found peer name=\"%s\" addr=%s rssi=%d",
+          _impl->peer_name.c_str(), _impl->peer_addr.c_str(),
+          _impl->cached_rssi);
 
     _impl->client = BLEDevice::createClient();
     _impl->client->setClientCallbacks(new ClientCallbacks(_impl));
 
     if (!_impl->client->connect(_impl->target)) {
+        log_e("BLEClient::connect failed addr=%s", _impl->peer_addr.c_str());
         delete _impl->target; _impl->target = nullptr;
         delete _impl->client; _impl->client = nullptr;
         return false;
     }
+    log_d("BLEClient connected");
 
     BLERemoteService* service = _impl->client->getService(svc);
     if (!service) {
+        log_e("GDX service %s not found", kGdxServiceUuid);
         _impl->client->disconnect();
         return false;
     }
+    log_d("GDX service discovered");
 
     _impl->cmd_char = service->getCharacteristic(BLEUUID(kGdxCommandCharUuid));
     _impl->rsp_char = service->getCharacteristic(BLEUUID(kGdxResponseCharUuid));
     if (!_impl->cmd_char || !_impl->rsp_char) {
+        log_e("missing characteristic cmd=%p rsp=%p",
+              (void*)_impl->cmd_char, (void*)_impl->rsp_char);
         _impl->client->disconnect();
         return false;
     }
+    log_d("chars discovered cmd=%s rsp=%s",
+          kGdxCommandCharUuid, kGdxResponseCharUuid);
 
     _impl->connected = true;
     g_active_impl = _impl;
@@ -206,7 +220,10 @@ bool BundledBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
 void BundledBleXport::disconnect() {
     if (g_active_impl == _impl) g_active_impl = nullptr;
     if (_impl->client) {
-        if (_impl->client->isConnected()) _impl->client->disconnect();
+        if (_impl->client->isConnected()) {
+            log_i("disconnect addr=%s", _impl->peer_addr.c_str());
+            _impl->client->disconnect();
+        }
         delete _impl->client;
         _impl->client = nullptr;
     }
@@ -243,10 +260,14 @@ bool BundledBleXport::write(const uint8_t* data, uint16_t len) {
 }
 
 bool BundledBleXport::subscribe(NotifyCb cb) {
-    if (!isConnected() || !_impl->rsp_char) return false;
+    if (!isConnected() || !_impl->rsp_char) {
+        log_e("subscribe with no connection");
+        return false;
+    }
     _impl->on_notify = std::move(cb);
     g_active_impl = _impl;
     _impl->rsp_char->registerForNotify(notifyTrampoline);
+    log_d("subscribed to response char");
     return true;
 }
 
