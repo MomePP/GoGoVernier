@@ -72,6 +72,7 @@ public:
     bool disableSensor(uint8_t channel);
     uint32_t availableChannelMask() const;
     uint32_t enabledChannelMask() const;
+    uint8_t  channelCount() const;
     const ChannelInfo* channel(uint8_t channel) const;
 
     // Streaming. period_ms == 0 → use device's typical period.
@@ -84,6 +85,10 @@ public:
     bool sampleReady() const;
     bool copySample(float* out, uint8_t& count);
     float measurement(uint8_t channel) const;
+
+    // Monotonic counter — incremented when a new sample frame arrives before
+    // the previous one was drained via copySample(). Reset on open().
+    uint32_t droppedSamples() const;
 
     // Identity + status accessors. Cached at connect; refreshed by
     // refreshStatus().
