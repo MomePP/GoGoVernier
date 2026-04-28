@@ -226,11 +226,37 @@ bool BundledBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
           _impl->peer_name.c_str(), _impl->peer_addr.c_str(),
           _impl->cached_rssi);
 
+    // Brief settle before connect. NimBLE host's GAP state machine takes a
+    // few HCI round-trips to drop scan-internal state after BLEScan::stop()
+    // returns, and an immediate ble_gap_connect can land while the host is
+    // still considered "scanning" — BLEClient's CONNECT event then returns
+    // status=2 (BLE_HS_EALREADY) even though the controller establishes the
+    // link (visible as the sensor's red→green LED).
+    vTaskDelay(pdMS_TO_TICKS(200));
+
     _impl->client = BLEDevice::createClient();
     _impl->client->setClientCallbacks(new ClientCallbacks(_impl));
 
-    if (!_impl->client->connect(_impl->target)) {
-        log_e("BLEClient::connect failed addr=%s", _impl->peer_addr.c_str());
+    bool connected = false;
+    for (int attempt = 1; attempt <= 3 && !connected; ++attempt) {
+        if (attempt > 1) {
+            log_w("BLEClient::connect retry %d/3 addr=%s",
+                  attempt, _impl->peer_addr.c_str());
+            // If the sensor accepted our previous attempt at the
+            // controller level, NimBLE host now thinks a connection
+            // exists. Drop it before retrying so the next connect()
+            // does not hit "A connection to %s already exists".
+            if (_impl->client->isConnected()) {
+                _impl->client->disconnect();
+                vTaskDelay(pdMS_TO_TICKS(300));
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        connected = _impl->client->connect(_impl->target);
+    }
+    if (!connected) {
+        log_e("BLEClient::connect failed after retries addr=%s",
+              _impl->peer_addr.c_str());
         delete _impl->target; _impl->target = nullptr;
         delete _impl->client; _impl->client = nullptr;
         return false;
