@@ -66,6 +66,12 @@ struct GoGoVernier::Impl {
     SemaphoreHandle_t resp_sem        = nullptr;     // single-shot, given by notify cb
     uint8_t           resp_buf[kRespBufSize] = {};
     uint16_t          resp_len        = 0;
+    // Stamped by encode() so onNotify() can drop stale responses (the late
+    // ACK to a previously-timed-out request must not satisfy the next
+    // sendRequest). Both fields are u16 so the "no pending request"
+    // sentinel 0xFFFF can't collide with a valid u8 byte we might see.
+    uint16_t          pending_rcnt    = 0xFFFF;
+    uint16_t          pending_cmd     = 0xFFFF;
 
     uint8_t nextRollingCounter() {
         // Pre-decrement, wrap 0x00 → 0xFF, matching godirect-py.
@@ -75,7 +81,8 @@ struct GoGoVernier::Impl {
     }
 
     // Build a request frame in `out`. `payload` may be null if `payload_len`
-    // is 0. Returns total frame length.
+    // is 0. Returns total frame length. Stamps `pending_rcnt`/`pending_cmd`
+    // so onNotify can match the response.
     uint8_t encode(uint8_t* out, uint8_t cmd_id,
                    const uint8_t* payload, uint8_t payload_len) {
         uint8_t total = static_cast<uint8_t>(kFrameHeaderSize + payload_len);
@@ -86,6 +93,8 @@ struct GoGoVernier::Impl {
         out[4] = cmd_id;
         if (payload && payload_len) memcpy(out + 5, payload, payload_len);
         out[3] = calculateChecksum(out, total);
+        pending_rcnt = out[2];
+        pending_cmd  = cmd_id;
         return total;
     }
 
@@ -99,12 +108,17 @@ struct GoGoVernier::Impl {
         resp_len = 0;
         if (!xport.write(out, len)) {
             log_e("xport.write failed cmd=0x%02X", out[4]);
+            pending_rcnt = pending_cmd = 0xFFFF;
             return false;
         }
         if (xSemaphoreTake(resp_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
             log_e("response timeout cmd=0x%02X", out[4]);
+            // Mark no pending so a late ACK gets dropped rather than
+            // satisfying the next sendRequest.
+            pending_rcnt = pending_cmd = 0xFFFF;
             return false;
         }
+        pending_rcnt = pending_cmd = 0xFFFF;
         return true;
     }
 
@@ -119,8 +133,25 @@ struct GoGoVernier::Impl {
             return;
         }
 
-        // Otherwise it's a reply to whatever request we last sent. Snapshot
-        // and unblock the waiter.
+        // Otherwise it should be a reply to whatever request we last sent.
+        // Validate the rolling counter and echoed cmd_id before unblocking
+        // the waiter — a late ACK to a previously-timed-out request would
+        // otherwise satisfy the next sendRequest with stale bytes.
+        if (pending_rcnt == 0xFFFF || pending_cmd == 0xFFFF) {
+            log_w("notify rx with no pending request (op=0x%02X) — dropped",
+                  data[0]);
+            return;
+        }
+        if (data[2] != pending_rcnt || data[4] != pending_cmd) {
+            log_w("stale resp rcnt=0x%02X cmd=0x%02X (want 0x%02X 0x%02X) — dropped",
+                  data[2], data[4],
+                  (unsigned)pending_rcnt, (unsigned)pending_cmd);
+            return;
+        }
+
+        if (len > kRespBufSize) {
+            log_w("response truncated %u -> %u", len, (unsigned)kRespBufSize);
+        }
         uint16_t copy_len = len > kRespBufSize ? kRespBufSize : len;
         memcpy(resp_buf, data, copy_len);
         resp_len = copy_len;
@@ -183,11 +214,22 @@ struct GoGoVernier::Impl {
         sample_ready = true;
     }
 
-    // Decode CMD_GET_DEVICE_INFO response. godirect-py struct:
-    //   "<xxxxxx16s16s32sHHBBBBHBBHBBBBBBI64s"
-    // The first 6 bytes are header (op,len,rcnt,checksum,cmd_id,spare).
+    // Decode CMD_GET_DEVICE_INFO response. godirect-py struct (after
+    // skipping the 6-byte header):
+    //   16s OrderCode      offset 0
+    //   16s SerialNumber   offset 16
+    //   32s DeviceName     offset 32
+    //    H  manufacturerId offset 64  (2 bytes, LE)
+    //    H  manufactYear   offset 66
+    //    B  month          offset 68
+    //    B  day            offset 69
+    //    BBH primary CPU   offset 70  (major, minor, build u16)
+    //    BBH secondary CPU offset 74
+    //    BBBBBB ble addr   offset 78  (6 bytes, reverse order)
+    //    I  NVRAM size     offset 84
+    //    64s description   offset 88
     void decodeDeviceInfo() {
-        if (resp_len < 6 + 16 + 16 + 32) return;
+        if (resp_len < 6 + 64) return;  // need at least the strings
         const uint8_t* p = resp_buf + 6;
         memset(info.order_code, 0, sizeof(info.order_code));
         memset(info.serial,     0, sizeof(info.serial));
@@ -196,12 +238,28 @@ struct GoGoVernier::Impl {
         info.order_code[15] = '\0';
         memcpy(info.serial,     p + 16,        16);
         info.serial[15]     = '\0';
-        memcpy(info.name,       p + 32,
-               sizeof(info.name) - 1);          // 32-byte field, our struct is 32
+        memcpy(info.name,       p + 32,        sizeof(info.name) - 1);
         info.name[sizeof(info.name) - 1] = '\0';
-        // Manufacturer ID + dates + FW versions follow at offset 6+64; we
-        // only consume what DeviceInfo currently exposes. Phase 3 can
-        // widen the struct.
+
+        // The rest of the response is optional — only populate what we
+        // have bytes for, in case some firmware variants ship a shorter
+        // struct.
+        if (resp_len >= 6 + 78) {
+            info.vid                   = leUnpack<uint16_t>(p + 64);
+            uint8_t major1             = p[70];
+            uint8_t minor1             = p[71];
+            uint8_t major2             = p[74];
+            uint8_t minor2             = p[75];
+            // Pack as (major << 8) | minor — the build numbers (u16 each)
+            // are dropped on the floor for now. Phase 3 widens DeviceInfo
+            // to expose them as full strings.
+            info.primary_cpu_version   = static_cast<uint16_t>((major1 << 8) | minor1);
+            info.secondary_cpu_version = static_cast<uint16_t>((major2 << 8) | minor2);
+        }
+        // pid: the protocol has no separate product id field — leave at 0
+        // and let downstream code key off (vid, order_code) when it needs
+        // a model identifier.
+        info.pid = 0;
     }
 
     // Decode CMD_GET_SENSOR_AVAILABLE_MASK / CMD_GET_DEFAULT_SENSORS_MASK.
