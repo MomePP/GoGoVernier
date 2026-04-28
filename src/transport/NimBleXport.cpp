@@ -228,10 +228,17 @@ bool NimBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
     _impl->client = NimBLEDevice::createClient();
     _impl->client->setClientCallbacks(new ClientCallbacks(_impl), /*deleteCallbacks=*/true);
 
+    // exchangeMTU=true: let h2zero kick off the MTU exchange right after
+    // BLE connect. Unlike the arduino-esp32 bundled BLE library (whose
+    // BLEClient::connect bailed on BLE_HS_EALREADY when the Vernier
+    // peripheral beat us to MTU REQUEST), h2zero's exchangeMTU() treats
+    // EALREADY as success — the peer-initiated case is fine. Default MTU
+    // 23 caps single ATT writes at 20 bytes; CMD_INIT is 25, so this
+    // exchange is mandatory before any handshake frame goes out.
     if (!_impl->client->connect(_impl->target,
                                 /*deleteAttributes=*/true,
                                 /*asyncConnect=*/false,
-                                /*exchangeMTU=*/false)) {
+                                /*exchangeMTU=*/true)) {
         log_e("NimBLEClient::connect failed addr=%s", _impl->peer_addr.c_str());
         delete _impl->target; _impl->target = nullptr;
         NimBLEDevice::deleteClient(_impl->client); _impl->client = nullptr;
@@ -239,16 +246,21 @@ bool NimBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
     }
     log_d("NimBLEClient connected");
 
-    // Negotiate ATT MTU explicitly. We passed exchangeMTU=false to dodge the
-    // BLE_HS_EALREADY race documented elsewhere, but staying at MTU=23 caps
-    // single writes at 20 bytes. CMD_INIT is 25. h2zero's exchangeMTU()
-    // tolerates BLE_HS_EALREADY (the peer-initiated case) so this is safe
-    // to call regardless of who got there first.
-    if (!_impl->client->exchangeMTU()) {
-        log_w("MTU exchange returned false — staying at default %d",
-              _impl->client->getMTU());
-    } else {
-        log_i("MTU negotiated = %u", (unsigned)_impl->client->getMTU());
+    // exchangeMTU is async inside h2zero. Poll getMTU() until it leaves
+    // the default 23 OR a short timeout fires. Service discovery + CMD_INIT
+    // both run on the negotiated MTU, so blocking briefly here avoids a
+    // first-write at MTU=23 that the peripheral silently drops.
+    {
+        const TickType_t kStep = pdMS_TO_TICKS(20);
+        const TickType_t kMax  = pdMS_TO_TICKS(800);
+        TickType_t waited = 0;
+        while (_impl->client->getMTU() <= 23 && waited < kMax) {
+            vTaskDelay(kStep);
+            waited += kStep;
+        }
+        log_i("MTU after settle = %u (waited %ums)",
+              (unsigned)_impl->client->getMTU(),
+              (unsigned)pdTICKS_TO_MS(waited));
     }
 
     NimBLERemoteService* service = _impl->client->getService(svc);
