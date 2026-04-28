@@ -11,12 +11,12 @@
 #include <Arduino.h>
 #include <string.h>
 
-#include "transport/BundledBleXport.h"
+#include "transport/NimBleXport.h"
 
 namespace gogo_vernier {
 
 struct GoGoVernier::Impl {
-    BundledBleXport xport;
+    NimBleXport xport;
 
     bool         connected      = false;
     bool         scanning       = false;

@@ -1,22 +1,25 @@
-// BundledBleXport — BleTransport implementation backed by the BLE library
-// shipped inside arduino-esp32 (libraries/BLE). On 3.3.x that library is
-// itself a NimBLE wrapper, which dodges the version-skew failure mode we
-// hit with MomePP/ArduinoBLE.
+// NimBleXport — BleTransport implementation backed by h2zero/NimBLE-Arduino.
+//
+// On arduino-esp32 3.3.x the NimBLE-Arduino library compiles against the
+// bundled NimBLE host (no vendored copy → no version skew with the BT
+// controller blob), and unlike the arduino-esp32-bundled `BLE` library it
+// doesn't force an MTU exchange on connect that races with peripherals
+// which initiate it themselves (Vernier GDX devices do).
 
 #pragma once
 
 #include "BleTransport.h"
 
-class BLEAdvertisedDevice;
-class BLEClient;
-class BLERemoteCharacteristic;
+class NimBLEAdvertisedDevice;
+class NimBLEClient;
+class NimBLERemoteCharacteristic;
 
 namespace gogo_vernier {
 
-class BundledBleXport : public BleTransport {
+class NimBleXport : public BleTransport {
 public:
-    BundledBleXport();
-    ~BundledBleXport() override;
+    NimBleXport();
+    ~NimBleXport() override;
 
     bool connect(const char* name, uint32_t scan_timeout_ms) override;
     void disconnect() override;
