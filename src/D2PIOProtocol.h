@@ -15,14 +15,16 @@ constexpr const char* kGdxServiceUuid       = "d91714ef-28b9-4f91-ba16-f0d9a604f
 constexpr const char* kGdxCommandCharUuid   = "f4bf14a6-c7d5-4b6d-8aa8-df1a7c83adcb";
 constexpr const char* kGdxResponseCharUuid  = "b41e6675-a329-40e0-aa01-44d2f444babe";
 
-// Frame layout on both characteristics:
-//   byte 0  : kFrameHeader (constant)
-//   byte 1  : total length in bytes (header through checksum, inclusive)
+// Frame layout on both characteristics (verbatim from godirect-py
+// `Device._GDX_init` and friends):
+//   byte 0  : kFrameHeader (constant 0x58)
+//   byte 1  : total length in bytes (the entire frame including this byte)
 //   byte 2  : rolling counter — request-side decrements 0xFF..0x00, wraps
-//   byte 3  : command id  (CMD_ID_*) on writes; response op on reads
-//   byte 4..N-2 : payload, command-specific
-//   byte N-1: 1's-complement checksum of bytes 0..N-2
+//   byte 3  : checksum (placeholder until calculateChecksum runs)
+//   byte 4  : command id (CMD_ID_*) on writes; response op on reads
+//   byte 5..N-1 : payload, command-specific
 constexpr uint8_t kFrameHeader = 0x58;
+constexpr uint8_t kFrameHeaderSize = 5;  // [magic][len][rcnt][checksum][op]
 
 // Command ids — godirect-py/godirect/device.py
 enum CmdId : uint8_t {
