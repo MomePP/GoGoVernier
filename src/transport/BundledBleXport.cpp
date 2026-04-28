@@ -23,6 +23,7 @@
 #include <BLERemoteService.h>
 #include <BLEScan.h>
 #include <BLEUUID.h>
+#include <esp_log.h>
 
 #include <string>
 
@@ -37,6 +38,18 @@ namespace {
 bool g_ble_inited = false;
 void ensureBleInited() {
     if (g_ble_inited) return;
+    // Quiet the bundled BLE library's debug logs. With CORE_DEBUG_LEVEL=4
+    // every advertisement byte is dumped at log_d level, which on ESP32-C3
+    // USB-CDC overruns the host TX buffer and we lose unrelated logs to
+    // truncation. Override per-tag so the rest of the firmware keeps its
+    // verbose logging.
+    esp_log_level_set("BLEDevice",            ESP_LOG_INFO);
+    esp_log_level_set("BLEScan",              ESP_LOG_INFO);
+    esp_log_level_set("BLEAdvertisedDevice",  ESP_LOG_WARN);
+    esp_log_level_set("BLEClient",            ESP_LOG_INFO);
+    esp_log_level_set("BLERemoteCharacteristic", ESP_LOG_INFO);
+    esp_log_level_set("BLERemoteService",     ESP_LOG_INFO);
+    esp_log_level_set("NimBLE",               ESP_LOG_WARN);
     BLEDevice::init("GoGoVernier");
     g_ble_inited = true;
 }
@@ -79,33 +92,33 @@ public:
           _service(service_uuid) {}
 
     void onResult(BLEAdvertisedDevice advertised) override {
-        // Filter by service UUID — D2PIO devices always advertise it.
+        // Named match takes precedence and bypasses the service-UUID gate:
+        // Vernier devices put the local name in the primary advertisement
+        // packet but only echo the GDX service UUID in the scan response.
+        // Active-scan reassembly is best-effort, so a saved-name reconnect
+        // must work even when isAdvertisingService() returns false.
+        if (!_proximity) {
+            if (advertised.haveName() &&
+                strcmp(advertised.getName().c_str(), _wanted.c_str()) == 0) {
+                if (_best) delete _best;
+                _best = new BLEAdvertisedDevice(advertised);
+                advertised.getScan()->stop();
+            }
+            return;
+        }
+
+        // Proximity mode: filter by service UUID, then track best RSSI.
         if (!advertised.haveServiceUUID() ||
             !advertised.isAdvertisingService(_service)) {
             return;
         }
-
-        if (_proximity) {
-            // Track best RSSI seen above the floor.
-            int rssi = advertised.getRSSI();
-            if (rssi < kProximityRssiFloor) return;
-            if (!_best || rssi > _best->getRSSI()) {
-                if (_best) delete _best;
-                _best = new BLEAdvertisedDevice(advertised);
-            }
-            // Don't abort the scan — keep looking for the strongest signal
-            // until the timeout. The session loop runs the scan to completion
-            // for proximity mode.
-            return;
-        }
-
-        // Named match — abort immediately.
-        if (advertised.haveName() &&
-            strcmp(advertised.getName().c_str(), _wanted.c_str()) == 0) {
+        int rssi = advertised.getRSSI();
+        if (rssi < kProximityRssiFloor) return;
+        if (!_best || rssi > _best->getRSSI()) {
             if (_best) delete _best;
             _best = new BLEAdvertisedDevice(advertised);
-            advertised.getScan()->stop();
         }
+        // Keep scanning until timeout to find the strongest signal.
     }
 
     // Caller takes ownership.
