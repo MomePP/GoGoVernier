@@ -53,13 +53,21 @@ void initBleOnce() {
     // USB-CDC overruns the host TX buffer and we lose unrelated logs to
     // truncation. Override per-tag so the rest of the firmware keeps its
     // verbose logging.
-    esp_log_level_set("BLEDevice",            ESP_LOG_INFO);
-    esp_log_level_set("BLEScan",              ESP_LOG_INFO);
-    esp_log_level_set("BLEAdvertisedDevice",  ESP_LOG_WARN);
-    esp_log_level_set("BLEClient",            ESP_LOG_INFO);
-    esp_log_level_set("BLERemoteCharacteristic", ESP_LOG_INFO);
-    esp_log_level_set("BLERemoteService",     ESP_LOG_INFO);
-    esp_log_level_set("NimBLE",               ESP_LOG_WARN);
+    // arduino-esp32's log_d/log_i/etc derive the tag from the source
+    // filename including the ".cpp" extension (see pathToFileName in
+    // esp32-hal-log.h). Set tags with the suffix to actually take effect —
+    // dropping it makes esp_log_level_set a silent no-op and the BLE
+    // library keeps spamming USB-CDC at DEBUG level.
+    esp_log_level_set("BLEDevice.cpp",                ESP_LOG_INFO);
+    esp_log_level_set("BLEScan.cpp",                  ESP_LOG_INFO);
+    esp_log_level_set("BLEAdvertisedDevice.cpp",      ESP_LOG_WARN);
+    esp_log_level_set("BLEClient.cpp",                ESP_LOG_INFO);
+    esp_log_level_set("BLERemoteCharacteristic.cpp",  ESP_LOG_INFO);
+    esp_log_level_set("BLERemoteService.cpp",         ESP_LOG_INFO);
+    esp_log_level_set("BLEUtils.cpp",                 ESP_LOG_WARN);
+    esp_log_level_set("BLEAddress.cpp",               ESP_LOG_WARN);
+    esp_log_level_set("BLEUUID.cpp",                  ESP_LOG_WARN);
+    esp_log_level_set("NimBLE",                       ESP_LOG_WARN);
 
     g_ble_mutex = xSemaphoreCreateMutex();
     BLEDevice::init("GoGoVernier");
