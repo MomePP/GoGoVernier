@@ -69,13 +69,25 @@ enum ChargerState : uint8_t {
 // 9 channels; godirect-py iterates 0..31 with the same bound.
 constexpr uint8_t kMaxChannels = 32;
 
-// 1's-complement checksum used by both godirect-py
-// (`Device._GDX_calculate_checksum`) and GDXLib (`D2PIO_CalculateChecksum`).
-// Sums bytes 0..len-2, returns ~sum & 0xFF.
-inline uint8_t calculateChecksum(const uint8_t* buf, uint8_t len_inclusive) {
-    uint16_t s = 0;
-    for (uint8_t i = 0; i + 1 < len_inclusive; ++i) s += buf[i];
-    return static_cast<uint8_t>(~s & 0xFF);
+// Frame checksum, ported byte-for-byte from godirect-py
+// (`Device._GDX_calculate_checksum`):
+//
+//   length = buff[1]
+//   checksum = -buff[3]                # cancels the placeholder
+//   for i in range(0, length):
+//       checksum = (checksum + buff[i]) & 0xFF
+//
+// Equivalent to: low 8 bits of the sum of every byte EXCEPT the checksum
+// byte itself (byte 3). Plain 8-bit sum — NOT a 1's complement, despite
+// what an earlier draft of the spec doc claimed.
+//
+// Call with `total_len = buf[1]` and an already-populated frame whose
+// `buf[3]` is the placeholder checksum (typically 0, doesn't matter —
+// the `-buf[3]` cancellation makes this work for any prior value).
+inline uint8_t calculateChecksum(const uint8_t* buf, uint8_t total_len) {
+    int s = -static_cast<int>(buf[3]);
+    for (uint8_t i = 0; i < total_len; ++i) s += buf[i];
+    return static_cast<uint8_t>(s & 0xFF);
 }
 
 }  // namespace gogo_vernier

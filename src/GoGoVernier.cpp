@@ -32,16 +32,6 @@ namespace {
 constexpr uint32_t kRequestTimeoutMs = 3000;
 constexpr uint16_t kRespBufSize      = 256;
 
-// Recompute checksum the godirect-py way: sum every byte in the frame
-// except the checksum byte itself, take the low 8 bits. The
-// _GDX_calculate_checksum routine does this by initialising the
-// accumulator with -buff[3] then summing the whole frame.
-uint8_t computeChecksum(const uint8_t* buf, uint8_t total_len) {
-    int s = -static_cast<int>(buf[3]);
-    for (uint8_t i = 0; i < total_len; ++i) s += buf[i];
-    return static_cast<uint8_t>(s & 0xFF);
-}
-
 // Deserialise a little-endian unsigned int from `buf[0..N-1]`.
 template <typename T>
 T leUnpack(const uint8_t* buf) {
@@ -95,7 +85,7 @@ struct GoGoVernier::Impl {
         out[3] = 0;            // checksum placeholder
         out[4] = cmd_id;
         if (payload && payload_len) memcpy(out + 5, payload, payload_len);
-        out[3] = computeChecksum(out, total);
+        out[3] = calculateChecksum(out, total);
         return total;
     }
 
