@@ -107,10 +107,10 @@ public:
           _service(service_uuid) {}
 
     void onResult(BLEAdvertisedDevice advertised) override {
-        // Named match takes precedence and bypasses the service-UUID gate:
+        // Named match takes precedence and bypasses the service-UUID gate.
         // Vernier devices put the local name in the primary advertisement
-        // packet but only echo the GDX service UUID in the scan response.
-        // Active-scan reassembly is best-effort, so a saved-name reconnect
+        // packet but only echo the GDX service UUID in the scan response,
+        // and active-scan reassembly is best-effort. A saved-name reconnect
         // must work even when isAdvertisingService() returns false.
         if (!_proximity) {
             if (advertised.haveName() &&
@@ -122,11 +122,20 @@ public:
             return;
         }
 
-        // Proximity mode: filter by service UUID, then track best RSSI.
-        if (!advertised.haveServiceUUID() ||
-            !advertised.isAdvertisingService(_service)) {
-            return;
+        // Proximity mode: same UUID-not-in-primary-adv problem. Accept
+        // either a service-UUID match OR a name starting with "GDX-" — the
+        // device family's local-name prefix is just as reliable a marker
+        // and lives in the primary advertisement on every Vernier device.
+        bool match = false;
+        if (advertised.haveServiceUUID() &&
+            advertised.isAdvertisingService(_service)) {
+            match = true;
+        } else if (advertised.haveName() &&
+                   strncmp(advertised.getName().c_str(), "GDX-", 4) == 0) {
+            match = true;
         }
+        if (!match) return;
+
         int rssi = advertised.getRSSI();
         if (rssi < kProximityRssiFloor) return;
         if (!_best || rssi > _best->getRSSI()) {
