@@ -72,6 +72,13 @@ struct GoGoVernier::Impl {
     // sentinel 0xFFFF can't collide with a valid u8 byte we might see.
     uint16_t          pending_rcnt    = 0xFFFF;
     uint16_t          pending_cmd     = 0xFFFF;
+    // Serialises sendRequest. The host MCU can fire C_CONNECT/C_SET_PERIOD
+    // on uartHandler while loop()-driven auto-connect is still mid-
+    // handshake on the main task; without this, both tasks call encode()
+    // (overwriting pending_rcnt/cmd for each other) and block on the same
+    // resp_sem. Held only across one wire request, never around
+    // open()/start() in their entirety.
+    SemaphoreHandle_t req_mutex       = nullptr;
 
     uint8_t nextRollingCounter() {
         // Pre-decrement, wrap 0x00 → 0xFF, matching godirect-py.
@@ -103,6 +110,16 @@ struct GoGoVernier::Impl {
     // floor (handles them in-place into channels[]) and only releases the
     // semaphore for a real reply.
     bool sendRequest(const uint8_t* out, uint8_t len, uint32_t timeout_ms) {
+        // One in-flight request at a time, no matter which task called us.
+        if (xSemaphoreTake(req_mutex, pdMS_TO_TICKS(timeout_ms + 1000)) != pdTRUE) {
+            log_e("req_mutex contended cmd=0x%02X", out[4]);
+            return false;
+        }
+        struct GiveOnExit {
+            SemaphoreHandle_t m;
+            ~GiveOnExit() { xSemaphoreGive(m); }
+        } _scope { req_mutex };
+
         // Drain any pending take so we don't accept a stale unblock.
         xSemaphoreTake(resp_sem, 0);
         resp_len = 0;
@@ -326,11 +343,13 @@ struct GoGoVernier::Impl {
 };
 
 GoGoVernier::GoGoVernier() : _impl(new Impl()) {
-    _impl->resp_sem = xSemaphoreCreateBinary();
+    _impl->resp_sem  = xSemaphoreCreateBinary();
+    _impl->req_mutex = xSemaphoreCreateMutex();
 }
 
 GoGoVernier::~GoGoVernier() {
-    if (_impl->resp_sem) vSemaphoreDelete(_impl->resp_sem);
+    if (_impl->resp_sem)  vSemaphoreDelete(_impl->resp_sem);
+    if (_impl->req_mutex) vSemaphoreDelete(_impl->req_mutex);
     delete _impl;
 }
 

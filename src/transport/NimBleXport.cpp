@@ -307,7 +307,13 @@ const char* NimBleXport::peerAddress() const { return _impl->peer_addr.c_str(); 
 
 bool NimBleXport::write(const uint8_t* data, uint16_t len) {
     if (!isConnected() || !_impl->cmd_char) return false;
-    return _impl->cmd_char->writeValue(data, len, /*response=*/false);
+    // Write-with-response. Vernier's command characteristic ACKs the
+    // L2CAP write before processing the frame — sending without response
+    // races against the controller's next ATT slot and the peripheral
+    // never delivers its notify reply, which surfaces here as a generic
+    // CMD_* timeout. ArduinoBLE / GDXLib historically used the default
+    // (with-response) and worked.
+    return _impl->cmd_char->writeValue(data, len, /*response=*/true);
 }
 
 bool NimBleXport::subscribe(NotifyCb cb) {
