@@ -1,14 +1,22 @@
-// GoGoVernier — Phase 0 stub.
+// GoGoVernier — Phase 1.
 //
-// All public methods compile to no-ops or sentinel values so the rest of the
-// firmware can link against the new lib while the real protocol + transport
-// layers land in subsequent phases (see .claude/plans/gdxlib-rewrite.md).
+// open() actually connects + subscribes via BundledBleXport. Protocol
+// exchange (Init / GetDeviceInfo / GetSensorAvailableMask / etc.) lands
+// in Phase 2. For now sample frames are not decoded, but the BLE link
+// reaches a stable connected+subscribed state and basic peer metadata
+// (address, scan-time RSSI) is populated.
 
 #include "GoGoVernier.h"
+
+#include <string.h>
+
+#include "transport/BundledBleXport.h"
 
 namespace gogo_vernier {
 
 struct GoGoVernier::Impl {
+    BundledBleXport xport;
+
     bool         connected      = false;
     bool         scanning       = false;
     bool         streaming      = false;
@@ -26,8 +34,49 @@ GoGoVernier::GoGoVernier() : _impl(new Impl()) {}
 
 GoGoVernier::~GoGoVernier() { delete _impl; }
 
-bool GoGoVernier::open(const char* /*name*/)        { return false; }
-void GoGoVernier::close()                            {}
+bool GoGoVernier::open(const char* name) {
+    if (_impl->connected) close();
+
+    constexpr uint32_t kScanMs = 5000;
+    if (!_impl->xport.connect(name, kScanMs)) {
+        return false;
+    }
+
+    // Subscribe to the response characteristic. Phase 2 will plug a real
+    // D2PIO frame decoder into this callback; for now we just count bytes.
+    _impl->xport.subscribe([](const uint8_t* /*data*/, uint16_t /*len*/) {
+        // Phase-2 stub.
+    });
+
+    // Cache what we already know without doing any protocol traffic.
+    const char* pname = _impl->xport.peerName();
+    const char* paddr = _impl->xport.peerAddress();
+    if (pname && *pname) {
+        strncpy(_impl->info.name, pname, sizeof(_impl->info.name) - 1);
+    } else if (paddr) {
+        strncpy(_impl->info.name, paddr, sizeof(_impl->info.name) - 1);
+    }
+    _impl->status.rssi = static_cast<int8_t>(_impl->xport.rssi());
+
+    _impl->connected = true;
+    _impl->dropped   = 0;
+    return true;
+}
+
+void GoGoVernier::close() {
+    _impl->xport.unsubscribe();
+    _impl->xport.disconnect();
+    _impl->connected     = false;
+    _impl->streaming     = false;
+    _impl->sample_ready  = false;
+    _impl->available     = 0;
+    _impl->enabled       = 0;
+    _impl->channel_count = 0;
+    memset(&_impl->info, 0, sizeof(_impl->info));
+    memset(&_impl->status, 0, sizeof(_impl->status));
+    for (auto& c : _impl->channels) c = {};
+}
+
 bool GoGoVernier::isConnected() const                { return _impl->connected; }
 bool GoGoVernier::isScanning() const                 { return _impl->scanning; }
 void GoGoVernier::abortScan()                        {}
