@@ -275,6 +275,22 @@ void BundledBleXport::disconnect() {
         if (_impl->client->isConnected()) {
             log_i("disconnect addr=%s", _impl->peer_addr.c_str());
             _impl->client->disconnect();
+            // BLEClient::disconnect() is async on NimBLE — the link is
+            // only actually torn down when the controller emits
+            // BLE_GAP_EVENT_DISCONNECT. Calling BLEClient::connect()
+            // before that arrives returns BLE_HS_EALREADY (status=2).
+            // Wait briefly for the link to settle before letting the
+            // caller initiate a new connect.
+            const TickType_t kStep = pdMS_TO_TICKS(20);
+            const TickType_t kMax  = pdMS_TO_TICKS(500);
+            TickType_t waited = 0;
+            while (_impl->client->isConnected() && waited < kMax) {
+                vTaskDelay(kStep);
+                waited += kStep;
+            }
+            if (_impl->client->isConnected()) {
+                log_w("BLEClient still reports connected after %ums", (unsigned)pdTICKS_TO_MS(waited));
+            }
         }
         delete _impl->client;
         _impl->client = nullptr;
