@@ -76,6 +76,11 @@ void initBleOnce() {
 
     g_ble_mutex = xSemaphoreCreateMutex();
     NimBLEDevice::init("GoGoVernier");
+    // Default ATT_MTU is 23 → max payload per write is 20 bytes. CMD_INIT
+    // is 25 bytes; the device drops the over-MTU write silently and we
+    // see it as a CMD_* timeout. Set the local preferred MTU to the NimBLE
+    // ceiling so the negotiated value is at least 28.
+    NimBLEDevice::setMTU(247);
 }
 
 void ensureBleInited() {
@@ -234,6 +239,18 @@ bool NimBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
     }
     log_d("NimBLEClient connected");
 
+    // Negotiate ATT MTU explicitly. We passed exchangeMTU=false to dodge the
+    // BLE_HS_EALREADY race documented elsewhere, but staying at MTU=23 caps
+    // single writes at 20 bytes. CMD_INIT is 25. h2zero's exchangeMTU()
+    // tolerates BLE_HS_EALREADY (the peer-initiated case) so this is safe
+    // to call regardless of who got there first.
+    if (!_impl->client->exchangeMTU()) {
+        log_w("MTU exchange returned false — staying at default %d",
+              _impl->client->getMTU());
+    } else {
+        log_i("MTU negotiated = %u", (unsigned)_impl->client->getMTU());
+    }
+
     NimBLERemoteService* service = _impl->client->getService(svc);
     if (!service) {
         log_e("GDX service %s not found", kGdxServiceUuid);
@@ -307,13 +324,12 @@ const char* NimBleXport::peerAddress() const { return _impl->peer_addr.c_str(); 
 
 bool NimBleXport::write(const uint8_t* data, uint16_t len) {
     if (!isConnected() || !_impl->cmd_char) return false;
-    // Write-with-response. Vernier's command characteristic ACKs the
-    // L2CAP write before processing the frame — sending without response
-    // races against the controller's next ATT slot and the peripheral
-    // never delivers its notify reply, which surfaces here as a generic
-    // CMD_* timeout. ArduinoBLE / GDXLib historically used the default
-    // (with-response) and worked.
-    return _impl->cmd_char->writeValue(data, len, /*response=*/true);
+    // The GDX command characteristic exposes WRITE_NO_RSP only — passing
+    // response=true returns false at the wrapper level. Default to
+    // response=false; we rely on the (>=28 byte) negotiated ATT MTU
+    // configured at NimBLEDevice::setMTU + NimBLEClient::exchangeMTU below
+    // to fit the 25-byte CMD_INIT frame.
+    return _impl->cmd_char->writeValue(data, len, /*response=*/false);
 }
 
 bool NimBleXport::subscribe(NotifyCb cb) {
