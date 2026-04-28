@@ -24,7 +24,10 @@
 #include <BLEScan.h>
 #include <BLEUUID.h>
 #include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
+#include <mutex>
 #include <string>
 
 #include "../D2PIOProtocol.h"
@@ -33,11 +36,18 @@ namespace gogo_vernier {
 
 namespace {
 
-// Process-wide BLEDevice init. Calling BLEDevice::init() more than once on
-// arduino-esp32 is safe but logs a warning — guard it ourselves.
-bool g_ble_inited = false;
-void ensureBleInited() {
-    if (g_ble_inited) return;
+// One-time init guarded by std::call_once so two tasks racing into
+// connect() can't both call BLEDevice::init() — that's how we hit
+// "BLE_INIT: controller init failed ESP_ERR_INVALID_STATE" and a NULL
+// getScan() pointer the first time auto-connect (main task) and a host
+// C_CONNECT command (uartHandler task) overlapped.
+std::once_flag g_ble_init_flag;
+
+// Serialises the entire connect/disconnect path. BLEScan and
+// BLEDevice::createClient are not reentrant in the bundled BLE library.
+SemaphoreHandle_t g_ble_mutex = nullptr;
+
+void initBleOnce() {
     // Quiet the bundled BLE library's debug logs. With CORE_DEBUG_LEVEL=4
     // every advertisement byte is dumped at log_d level, which on ESP32-C3
     // USB-CDC overruns the host TX buffer and we lose unrelated logs to
@@ -50,8 +60,13 @@ void ensureBleInited() {
     esp_log_level_set("BLERemoteCharacteristic", ESP_LOG_INFO);
     esp_log_level_set("BLERemoteService",     ESP_LOG_INFO);
     esp_log_level_set("NimBLE",               ESP_LOG_WARN);
+
+    g_ble_mutex = xSemaphoreCreateMutex();
     BLEDevice::init("GoGoVernier");
-    g_ble_inited = true;
+}
+
+void ensureBleInited() {
+    std::call_once(g_ble_init_flag, initBleOnce);
 }
 
 }  // namespace
@@ -152,7 +167,19 @@ BundledBleXport::~BundledBleXport() {
 bool BundledBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
     ensureBleInited();
 
+    // Serialise concurrent connect attempts (auto-connect from main task vs
+    // C_CONNECT from uartHandler task). Without this BLEDevice::createClient
+    // and BLEScan trip over each other and we crash inside getScan().
+    xSemaphoreTake(g_ble_mutex, portMAX_DELAY);
+    struct GiveOnExit {
+        ~GiveOnExit() { xSemaphoreGive(g_ble_mutex); }
+    } _scope;
+
     BLEScan* scan = BLEDevice::getScan();
+    if (!scan) {
+        log_e("BLEDevice::getScan() returned NULL — controller init failed earlier");
+        return false;
+    }
     BLEUUID  svc(kGdxServiceUuid);
     TargetFinder finder(name, svc);
 
@@ -218,6 +245,14 @@ bool BundledBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
 }
 
 void BundledBleXport::disconnect() {
+    // Take the same mutex connect() holds — disconnect can race with a
+    // concurrent connect attempt (e.g. host MCU sends C_DISCONNECT while
+    // an auto-connect is mid-scan).
+    if (g_ble_mutex) xSemaphoreTake(g_ble_mutex, portMAX_DELAY);
+    struct GiveOnExit {
+        ~GiveOnExit() { if (g_ble_mutex) xSemaphoreGive(g_ble_mutex); }
+    } _scope;
+
     if (g_active_impl == _impl) g_active_impl = nullptr;
     if (_impl->client) {
         if (_impl->client->isConnected()) {
