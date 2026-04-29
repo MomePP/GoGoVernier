@@ -77,17 +77,17 @@ void initBleOnce() {
 
     g_ble_mutex = xSemaphoreCreateMutex();
 
-    // Set the local preferred ATT MTU BEFORE NimBLEDevice::init so the
-    // value is in place when the host stack registers and the peer's
-    // first MTU REQUEST is responded to. Default ATT_MTU is 23 → max
-    // single-write payload is MTU-3 = 20 bytes, but CMD_INIT is 25 and
-    // h2zero's NimBLERemoteValueAttribute::writeValue truncates over-MTU
-    // writes to MTU-3 when the characteristic is WRITE_NO_RSP (long-
-    // write requires write-with-response, which the GDX cmd char does
-    // not advertise). The truncated frame is silently dropped by the
-    // peripheral and we time out waiting for the notify reply.
-    NimBLEDevice::setMTU(247);
+    // setMTU must run AFTER init: ble_att_set_preferred_mtu only takes
+    // effect once the NimBLE host stack is registered. Calling it before
+    // init() silently fails and leaves the local preferred MTU at the
+    // 23-byte default, which caps single ATT writes at 20 bytes — the
+    // 25-byte CMD_INIT then gets truncated by NimBLERemoteValueAttribute::
+    // writeValue's long-write fallback and the peripheral drops it.
     NimBLEDevice::init("GoGoVernier");
+    bool mtuOk = NimBLEDevice::setMTU(247);
+    Serial.printf("[XPORT] init done, setMTU(247) -> %s, getMTU()=%u\r\n",
+                  mtuOk ? "ok" : "FAIL",
+                  (unsigned)NimBLEDevice::getMTU());
 }
 
 void ensureBleInited() {
@@ -113,6 +113,12 @@ struct NimBleXport::Impl {
 static NimBleXport::Impl* g_active_impl = nullptr;
 static void notifyTrampoline(NimBLERemoteCharacteristic* /*chr*/,
                              uint8_t* data, size_t len, bool /*isNotify*/) {
+    Serial.printf("[XPORT] notify rx len=%u op=0x%02X rcnt=0x%02X cksum=0x%02X cmd=0x%02X\r\n",
+                  (unsigned)len,
+                  len > 0 ? data[0] : 0,
+                  len > 2 ? data[2] : 0,
+                  len > 3 ? data[3] : 0,
+                  len > 4 ? data[4] : 0);
     if (g_active_impl && g_active_impl->on_notify) {
         g_active_impl->on_notify(data, static_cast<uint16_t>(len));
     }
@@ -305,8 +311,22 @@ bool NimBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
         _impl->client->disconnect();
         return false;
     }
-    log_d("chars discovered cmd=%s rsp=%s",
-          kGdxCommandCharUuid, kGdxResponseCharUuid);
+    // Dump the actual char properties advertised by the peer so we know
+    // whether to use write-with-response or write-without-response. Goes
+    // straight to Serial because the ESP_LOG path is unreliable in the
+    // dense BLE bring-up window (USB-CDC overruns + tag-level filtering).
+    Serial.printf(
+        "[XPORT] cmd_char props: w=%d wnr=%d notify=%d indicate=%d  "
+        "rsp_char props: w=%d wnr=%d notify=%d indicate=%d  MTU=%u\r\n",
+        (int)_impl->cmd_char->canWrite(),
+        (int)_impl->cmd_char->canWriteNoResponse(),
+        (int)_impl->cmd_char->canNotify(),
+        (int)_impl->cmd_char->canIndicate(),
+        (int)_impl->rsp_char->canWrite(),
+        (int)_impl->rsp_char->canWriteNoResponse(),
+        (int)_impl->rsp_char->canNotify(),
+        (int)_impl->rsp_char->canIndicate(),
+        (unsigned)_impl->client->getMTU());
 
     _impl->connected = true;
     g_active_impl = _impl;
@@ -362,12 +382,27 @@ const char* NimBleXport::peerAddress() const { return _impl->peer_addr.c_str(); 
 
 bool NimBleXport::write(const uint8_t* data, uint16_t len) {
     if (!isConnected() || !_impl->cmd_char) return false;
-    // The GDX command characteristic exposes WRITE_NO_RSP only — passing
-    // response=true returns false at the wrapper level. Default to
-    // response=false; we rely on the (>=28 byte) negotiated ATT MTU
-    // configured at NimBLEDevice::setMTU + NimBLEClient::exchangeMTU below
-    // to fit the 25-byte CMD_INIT frame.
-    return _impl->cmd_char->writeValue(data, len, /*response=*/false);
+    // Pick the write mode based on what the peer actually advertises.
+    // GDXLib uses ArduinoBLE's writeValue() default which auto-selects;
+    // we replicate that logic explicitly. Prefer write-with-response when
+    // the char supports it because:
+    //   1. h2zero's writeValue with response=false truncates anything
+    //      length > MTU-3 (long-write requires response).
+    //   2. The peripheral acks the L2CAP write before processing, so the
+    //      central knows the frame landed before we wait on a notify.
+    bool use_response = _impl->cmd_char->canWrite()
+                            ? true
+                            : false;
+    bool ok = _impl->cmd_char->writeValue(data, len, use_response);
+    if (!ok) {
+        Serial.printf("[XPORT] writeValue len=%u response=%d FAILED\r\n",
+                      (unsigned)len, (int)use_response);
+    } else {
+        Serial.printf("[XPORT] write ok len=%u response=%d cmd=0x%02X rcnt=0x%02X\r\n",
+                      (unsigned)len, (int)use_response,
+                      (unsigned)data[4], (unsigned)data[2]);
+    }
+    return ok;
 }
 
 bool NimBleXport::subscribe(NotifyCb cb) {
@@ -377,11 +412,10 @@ bool NimBleXport::subscribe(NotifyCb cb) {
     }
     _impl->on_notify = std::move(cb);
     g_active_impl = _impl;
-    if (!_impl->rsp_char->subscribe(/*notifications=*/true, notifyTrampoline)) {
-        log_e("subscribe failed");
-        return false;
-    }
-    log_d("subscribed to response char");
+    bool ok = _impl->rsp_char->subscribe(/*notifications=*/true, notifyTrampoline);
+    Serial.printf("[XPORT] subscribe(notifications=true) -> %s\r\n",
+                  ok ? "ok" : "FAIL");
+    if (!ok) return false;
     return true;
 }
 
