@@ -80,6 +80,17 @@ struct GoGoVernier::Impl {
     // open()/start() in their entirety.
     SemaphoreHandle_t req_mutex       = nullptr;
 
+    // Serialises the entire open()/close()/start()/stop() bodies. Without
+    // this, a concurrent startReading from a host-MCU C_CONNECT can
+    // interleave SET_PERIOD writes between two SENSOR_INFO reads in the
+    // open() handshake loop and confuse the device into dropping
+    // subsequent SENSOR_INFO replies. session_mutex is taken at the top
+    // of each public method, held across all wire requests for that
+    // session phase. req_mutex still wraps individual sendRequest calls
+    // so a notify cb landing during a multi-step phase is matched to
+    // the right pending_cmd.
+    SemaphoreHandle_t session_mutex   = nullptr;
+
     uint8_t nextRollingCounter() {
         // Pre-decrement, wrap 0x00 → 0xFF, matching godirect-py.
         if (rolling_counter == 0) rolling_counter = 0xFF;
@@ -353,17 +364,30 @@ struct GoGoVernier::Impl {
 };
 
 GoGoVernier::GoGoVernier() : _impl(new Impl()) {
-    _impl->resp_sem  = xSemaphoreCreateBinary();
-    _impl->req_mutex = xSemaphoreCreateMutex();
+    _impl->resp_sem      = xSemaphoreCreateBinary();
+    _impl->req_mutex     = xSemaphoreCreateMutex();
+    // Recursive so open() can call close() internally while holding the
+    // session mutex without deadlocking.
+    _impl->session_mutex = xSemaphoreCreateRecursiveMutex();
 }
 
 GoGoVernier::~GoGoVernier() {
-    if (_impl->resp_sem)  vSemaphoreDelete(_impl->resp_sem);
-    if (_impl->req_mutex) vSemaphoreDelete(_impl->req_mutex);
+    if (_impl->resp_sem)      vSemaphoreDelete(_impl->resp_sem);
+    if (_impl->req_mutex)     vSemaphoreDelete(_impl->req_mutex);
+    if (_impl->session_mutex) vSemaphoreDelete(_impl->session_mutex);
     delete _impl;
 }
 
 bool GoGoVernier::open(const char* name) {
+    // Serialise the entire session phase. Concurrent open() / start() /
+    // stop() / close() callers block here. Recursive mutex so the
+    // close() call below can re-take without deadlocking.
+    xSemaphoreTakeRecursive(_impl->session_mutex, portMAX_DELAY);
+    struct GiveOnExit {
+        SemaphoreHandle_t m;
+        ~GiveOnExit() { xSemaphoreGiveRecursive(m); }
+    } _scope { _impl->session_mutex };
+
     if (_impl->connected) close();
 
     constexpr uint32_t kScanMs = 5000;
@@ -472,6 +496,12 @@ bool GoGoVernier::open(const char* name) {
 }
 
 void GoGoVernier::close() {
+    xSemaphoreTakeRecursive(_impl->session_mutex, portMAX_DELAY);
+    struct GiveOnExit {
+        SemaphoreHandle_t m;
+        ~GiveOnExit() { xSemaphoreGiveRecursive(m); }
+    } _scope { _impl->session_mutex };
+
     log_i("close");
     if (_impl->streaming) stop();
     _impl->xport.unsubscribe();
@@ -516,15 +546,28 @@ const ChannelInfo* GoGoVernier::channel(uint8_t ch) const {
 }
 
 bool GoGoVernier::start(uint32_t period_ms) {
+    // Take session mutex BEFORE checking state — concurrent open() may be
+    // mid-handshake; we want to wait for it to finish (so available mask
+    // is populated) rather than racing through with mask=0 and timing
+    // out CMD_START_MEASUREMENTS.
+    xSemaphoreTakeRecursive(_impl->session_mutex, portMAX_DELAY);
+    struct GiveOnExit {
+        SemaphoreHandle_t m;
+        ~GiveOnExit() { xSemaphoreGiveRecursive(m); }
+    } _scope { _impl->session_mutex };
+
     if (!_impl->connected) return false;
-    // Refuse if open() handshake hasn't populated available channels yet.
-    // VernierAdapter's idempotent-connect path can return success while
-    // open() is still mid-handshake on another task, and a concurrent
-    // startReading would then send CMD_START_MEASUREMENTS with mask=0
-    // and time out. Block until the handshake has run.
     if (_impl->available == 0) {
         log_w("start() refused: handshake incomplete (available mask=0)");
         return false;
+    }
+    if (_impl->streaming) {
+        // Already streaming. Idempotent — caller is e.g. a duplicate
+        // host-MCU connectAndReport. Don't re-encode SET_PERIOD +
+        // START_MEAS, that wastes wire bandwidth and confuses the
+        // device's stream state.
+        log_d("start() called while already streaming — no-op");
+        return true;
     }
     if (period_ms) _impl->period_ms = static_cast<uint16_t>(period_ms);
 
@@ -571,6 +614,12 @@ bool GoGoVernier::start(uint32_t period_ms) {
 }
 
 bool GoGoVernier::stop() {
+    xSemaphoreTakeRecursive(_impl->session_mutex, portMAX_DELAY);
+    struct GiveOnExit {
+        SemaphoreHandle_t m;
+        ~GiveOnExit() { xSemaphoreGiveRecursive(m); }
+    } _scope { _impl->session_mutex };
+
     if (!_impl->connected || !_impl->streaming) {
         _impl->streaming = false;
         return true;
