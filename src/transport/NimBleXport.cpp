@@ -59,21 +59,18 @@ std::once_flag g_ble_init_flag;
 SemaphoreHandle_t g_ble_mutex = nullptr;
 
 void initBleOnce() {
-    // Make our own log_i / log_d visible. With USE_ESP_IDF_LOG defined
-    // globally, log_* macros route through esp_log_write with tag
-    // "ARDUINO". Default ESP_LOG level for unset tags is WARN on
-    // arduino-esp32, so log_i and log_d were silently dropped, leaving
-    // us blind to the BLE bring-up sequence. Force ARDUINO tag to DEBUG.
-    esp_log_level_set("ARDUINO",                         ESP_LOG_DEBUG);
-
-    // Quiet NimBLE-Arduino's per-event log spam. Its sources tag with
-    // their own component names (no ".cpp" suffix in the NIMBLE_LOG_*
-    // path), so set a few common ones plus a "*" fallback at WARN.
-    esp_log_level_set("*",                               ESP_LOG_WARN);
-    esp_log_level_set("ARDUINO",                         ESP_LOG_DEBUG);  // re-apply after "*"
-    esp_log_level_set("NimBLEDevice",                    ESP_LOG_INFO);
-    esp_log_level_set("NimBLEClient",                    ESP_LOG_INFO);
-    esp_log_level_set("NimBLEScan",                      ESP_LOG_INFO);
+    // Per-tag log gating. With USE_ESP_IDF_LOG defined globally (see
+    // platformio.ini debug env), arduino-esp32's log_*() macros route
+    // through esp_log_write with tag = ARDUHAL_ESP_LOG_TAG ("ARDUINO").
+    // Default tag level on arduino-esp32 is WARN, so log_i / log_d are
+    // dropped unless we explicitly raise the ARDUINO tag here. Quiet
+    // NimBLE-Arduino's component tags (their NIMBLE_LOG_* path uses
+    // its own LOG_TAG strings — no ".cpp" suffix).
+    esp_log_level_set("*",            ESP_LOG_WARN);
+    esp_log_level_set("ARDUINO",      ESP_LOG_DEBUG);
+    esp_log_level_set("NimBLEDevice", ESP_LOG_INFO);
+    esp_log_level_set("NimBLEClient", ESP_LOG_INFO);
+    esp_log_level_set("NimBLEScan",   ESP_LOG_INFO);
 
     g_ble_mutex = xSemaphoreCreateMutex();
 
@@ -85,9 +82,9 @@ void initBleOnce() {
     // writeValue's long-write fallback and the peripheral drops it.
     NimBLEDevice::init("GoGoVernier");
     bool mtuOk = NimBLEDevice::setMTU(247);
-    Serial.printf("[XPORT] init done, setMTU(247) -> %s, getMTU()=%u\r\n",
-                  mtuOk ? "ok" : "FAIL",
-                  (unsigned)NimBLEDevice::getMTU());
+    log_i("BLE init done, setMTU(247) -> %s, getMTU()=%u",
+          mtuOk ? "ok" : "FAIL",
+          (unsigned)NimBLEDevice::getMTU());
 }
 
 void ensureBleInited() {
@@ -113,13 +110,6 @@ struct NimBleXport::Impl {
 static NimBleXport::Impl* g_active_impl = nullptr;
 static void notifyTrampoline(NimBLERemoteCharacteristic* /*chr*/,
                              uint8_t* data, size_t len, bool /*isNotify*/) {
-    Serial.printf("[XPORT] notify rx len=%u  op=0x%02X b1=0x%02X rcnt=0x%02X cksum=0x%02X cmd=0x%02X\r\n",
-                  (unsigned)len,
-                  len > 0 ? data[0] : 0,
-                  len > 1 ? data[1] : 0,
-                  len > 2 ? data[2] : 0,
-                  len > 3 ? data[3] : 0,
-                  len > 4 ? data[4] : 0);
     if (g_active_impl && g_active_impl->on_notify) {
         g_active_impl->on_notify(data, static_cast<uint16_t>(len));
     }
@@ -312,22 +302,12 @@ bool NimBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
         _impl->client->disconnect();
         return false;
     }
-    // Dump the actual char properties advertised by the peer so we know
-    // whether to use write-with-response or write-without-response. Goes
-    // straight to Serial because the ESP_LOG path is unreliable in the
-    // dense BLE bring-up window (USB-CDC overruns + tag-level filtering).
-    Serial.printf(
-        "[XPORT] cmd_char props: w=%d wnr=%d notify=%d indicate=%d  "
-        "rsp_char props: w=%d wnr=%d notify=%d indicate=%d  MTU=%u\r\n",
-        (int)_impl->cmd_char->canWrite(),
-        (int)_impl->cmd_char->canWriteNoResponse(),
-        (int)_impl->cmd_char->canNotify(),
-        (int)_impl->cmd_char->canIndicate(),
-        (int)_impl->rsp_char->canWrite(),
-        (int)_impl->rsp_char->canWriteNoResponse(),
-        (int)_impl->rsp_char->canNotify(),
-        (int)_impl->rsp_char->canIndicate(),
-        (unsigned)_impl->client->getMTU());
+    log_i("char props: cmd[w=%d wnr=%d] rsp[notify=%d indicate=%d] MTU=%u",
+          (int)_impl->cmd_char->canWrite(),
+          (int)_impl->cmd_char->canWriteNoResponse(),
+          (int)_impl->rsp_char->canNotify(),
+          (int)_impl->rsp_char->canIndicate(),
+          (unsigned)_impl->client->getMTU());
 
     _impl->connected = true;
     g_active_impl = _impl;
@@ -385,23 +365,18 @@ bool NimBleXport::write(const uint8_t* data, uint16_t len) {
     if (!isConnected() || !_impl->cmd_char) return false;
     // Pick the write mode based on what the peer actually advertises.
     // GDXLib uses ArduinoBLE's writeValue() default which auto-selects;
-    // we replicate that logic explicitly. Prefer write-with-response when
-    // the char supports it because:
-    //   1. h2zero's writeValue with response=false truncates anything
-    //      length > MTU-3 (long-write requires response).
-    //   2. The peripheral acks the L2CAP write before processing, so the
-    //      central knows the frame landed before we wait on a notify.
-    bool use_response = _impl->cmd_char->canWrite()
-                            ? true
-                            : false;
+    // we replicate that logic explicitly. Prefer write-with-response
+    // when the char supports it; h2zero's writeValue with response=false
+    // truncates length > MTU-3 (long-write requires response).
+    bool use_response = _impl->cmd_char->canWrite();
     bool ok = _impl->cmd_char->writeValue(data, len, use_response);
     if (!ok) {
-        Serial.printf("[XPORT] writeValue len=%u response=%d FAILED\r\n",
-                      (unsigned)len, (int)use_response);
+        log_e("xport write FAILED len=%u resp=%d cmd=0x%02X",
+              (unsigned)len, (int)use_response, (unsigned)data[4]);
     } else {
-        Serial.printf("[XPORT] write ok len=%u response=%d cmd=0x%02X rcnt=0x%02X\r\n",
-                      (unsigned)len, (int)use_response,
-                      (unsigned)data[4], (unsigned)data[2]);
+        log_d("xport write ok len=%u resp=%d cmd=0x%02X rcnt=0x%02X",
+              (unsigned)len, (int)use_response,
+              (unsigned)data[4], (unsigned)data[2]);
     }
     return ok;
 }
@@ -414,9 +389,11 @@ bool NimBleXport::subscribe(NotifyCb cb) {
     _impl->on_notify = std::move(cb);
     g_active_impl = _impl;
     bool ok = _impl->rsp_char->subscribe(/*notifications=*/true, notifyTrampoline);
-    Serial.printf("[XPORT] subscribe(notifications=true) -> %s\r\n",
-                  ok ? "ok" : "FAIL");
-    if (!ok) return false;
+    if (!ok) {
+        log_e("subscribe failed");
+        return false;
+    }
+    log_d("subscribed to response char");
     return true;
 }
 

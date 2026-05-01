@@ -415,11 +415,14 @@ bool GoGoVernier::open(const char* name) {
         log_d("CMD_INIT ack");
     }
 
-    // CMD_GET_DEVICE_INFO
+    // CMD_GET_DEVICE_INFO — observed to take noticeably longer to reply
+    // than the other queries on GDX-LC (well beyond the 3 s default).
+    // Use a wider timeout. Failure is non-fatal: the cached scan-time
+    // peer name is preserved and downstream channel discovery continues.
     {
         uint8_t n = _impl->encode(buf, CMD_GET_DEVICE_INFO, nullptr, 0);
-        if (!_impl->sendRequest(buf, n, kRequestTimeoutMs)) {
-            log_e("CMD_GET_DEVICE_INFO failed");
+        if (!_impl->sendRequest(buf, n, /*timeout_ms=*/8000)) {
+            log_w("CMD_GET_DEVICE_INFO timed out — keeping advertised name only");
         } else {
             _impl->decodeDeviceInfo();
             log_i("device order=\"%s\" serial=\"%s\" name=\"%s\"",
