@@ -10,10 +10,23 @@
 #pragma once
 
 #include <stdint.h>
+#include <functional>
 
 #include "D2PIOProtocol.h"
 
 namespace gogo_vernier {
+
+// One decoded measurement frame, packed in ascending channel-bit order so
+// values[0] is the lowest-numbered enabled channel. Mirrors copySample()
+// layout — the host wire protocol consumes the same shape.
+struct Sample {
+    uint32_t enabled_mask;
+    uint8_t  count;
+    float    values[kMaxChannels];
+};
+
+using SampleCallback = std::function<void(const Sample&)>;
+
 
 // One row of GET_SENSOR_INFO. Field set tracks
 // godirect-py/godirect/sensor.py:Sensor verbatim. All fields owned by the
@@ -63,6 +76,13 @@ public:
     bool open(const char* name);
     void close();
     bool isConnected() const;
+    // True only after open() has finished the full D2PIO handshake
+    // (INIT → DEVICE_INFO → AVAILABLE_MASK → SENSOR_INFO×N) and the
+    // available mask is populated. Use this — not isConnected() — for
+    // idempotent open guards in callers, otherwise a concurrent
+    // start()/startReading() can race in with available==0 and send
+    // CMD_START_MEASUREMENTS with mask=0.
+    bool isReady() const;
     bool isScanning() const;
     void abortScan();
 
@@ -80,11 +100,17 @@ public:
     bool stop();
     bool isStreaming() const;
 
-    // Sample retrieval — Phase 0/1 keeps the polling shape; Phase 3 adds an
-    // onSample(std::function<...>) callback path.
+    // Sample retrieval. Two paths, both fed from the same notify callback:
+    //   - Polling: sampleReady() / copySample() — single-slot, drops if
+    //     consumer doesn't drain fast enough (droppedSamples() reports it).
+    //   - Push: onSample(cb) — invoked synchronously in the NimBLE notify
+    //     task right after each decoded real32 frame. cb MUST NOT block;
+    //     it runs on the host BLE task and any slowness back-pressures
+    //     subsequent notifications. Pass {} to clear.
     bool sampleReady() const;
     bool copySample(float* out, uint8_t& count);
     float measurement(uint8_t channel) const;
+    void onSample(SampleCallback cb);
 
     // Monotonic counter — incremented when a new sample frame arrives before
     // the previous one was drained via copySample(). Reset on open().

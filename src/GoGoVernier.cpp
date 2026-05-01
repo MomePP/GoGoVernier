@@ -49,6 +49,12 @@ struct GoGoVernier::Impl {
 
     // Connection / streaming state.
     bool         connected      = false;
+    // Set true only after open() finishes the full D2PIO handshake
+    // (INIT, DEVICE_INFO, AVAILABLE_MASK, SENSOR_INFO×N) and the
+    // channel array is populated. `connected` flips earlier (right
+    // after the BLE link is up) which is too soon for callers to
+    // start streaming.
+    bool         ready          = false;
     bool         scanning       = false;
     bool         streaming      = false;
     bool         sample_ready   = false;
@@ -90,6 +96,11 @@ struct GoGoVernier::Impl {
     // so a notify cb landing during a multi-step phase is matched to
     // the right pending_cmd.
     SemaphoreHandle_t session_mutex   = nullptr;
+
+    // Push-mode consumer. Fired from decodeMeasurement on the NimBLE
+    // notify task. Empty (default) → push path is disabled and only
+    // the polling sample_ready path runs.
+    SampleCallback    on_sample;
 
     uint8_t nextRollingCounter() {
         // Pre-decrement, wrap 0x00 → 0xFF, matching godirect-py.
@@ -230,8 +241,22 @@ struct GoGoVernier::Impl {
             idx         = 8;
             mask        = (sno < kMaxChannels) ? (1u << sno) : 0;
             is_real32   = true;
+        } else if (meas_type == MEAS_DROPPED && len >= 9) {
+            // Device-reported drop notification. Layout per godirect-py
+            // _GDX_decode_meas_response:
+            //   [5..6] u16 sensor_mask LE   (which channels lost samples)
+            //   [7..8] u16 drop_count LE    (how many samples lost)
+            // Add to the local drop counter — distinct from our
+            // "previous sample wasn't drained" path above; both feed the
+            // same droppedSamples() accessor since the host only cares
+            // about the aggregate.
+            uint16_t drop_count = leUnpack<uint16_t>(data + 7);
+            dropped += drop_count;
+            log_w("device-reported %u dropped samples (mask=0x%04X)",
+                  drop_count, leUnpack<uint16_t>(data + 5));
+            return;
         } else {
-            return; // ignore int32 / start_time / dropped / period for now
+            return; // ignore int32 / start_time / period for now
         }
 
         if (!is_real32 || count == 0 || mask == 0) return;
@@ -250,6 +275,26 @@ struct GoGoVernier::Impl {
             }
         }
         sample_ready = true;
+
+        // Push path. Build the dense Sample once and hand off. Iterate
+        // `enabled` (not the frame's `mask`) so the layout matches
+        // copySample() — the host wire protocol consumes the same shape
+        // regardless of which path filled it. Frames carrying only a
+        // subset of enabled channels still publish the most recent
+        // value for every enabled channel since channels[i].value
+        // sticks until the next frame updates it.
+        if (on_sample) {
+            Sample s = {};
+            s.enabled_mask = enabled;
+            uint8_t k = 0;
+            for (uint8_t i = 0; i < kMaxChannels; ++i) {
+                if (enabled & (1u << i)) {
+                    s.values[k++] = channels[i].value;
+                }
+            }
+            s.count = k;
+            on_sample(s);
+        }
     }
 
     // Decode CMD_GET_DEVICE_INFO response. godirect-py struct (after
@@ -488,10 +533,27 @@ bool GoGoVernier::open(const char* name) {
         }
     }
 
-    // Default-enable everything available (mirrors the old GDXLib /
-    // VernierAdapter behaviour). Phase 4 will respect mutual_exclusion_mask.
-    _impl->enabled = _impl->available;
+    // Default-enable: walk available bits in ascending order and skip any
+    // whose mutual_exclusion_mask intersects bits already enabled. This
+    // gives a deterministic default for devices like GDX-3MG (low+high
+    // range mutually exclusive 3+3) and GDX-ACC (accel ranges) — first
+    // bit wins, conflicts stay off. Caller can flip the choice later via
+    // disable/enable.
+    _impl->enabled = 0;
+    for (uint8_t i = 0; i < kMaxChannels; ++i) {
+        if (!(_impl->available & (1u << i))) continue;
+        uint32_t conflict = _impl->channels[i].mutual_exclusion_mask & ~(1u << i);
+        if (conflict & _impl->enabled) {
+            _impl->channels[i].enabled = false;
+            log_d("ch%u skipped — conflicts with enabled mask 0x%08X", i,
+                  (unsigned)_impl->enabled);
+            continue;
+        }
+        _impl->enabled |= (1u << i);
+        _impl->channels[i].enabled = true;
+    }
 
+    _impl->ready = true;
     return true;
 }
 
@@ -506,6 +568,7 @@ void GoGoVernier::close() {
     if (_impl->streaming) stop();
     _impl->xport.unsubscribe();
     _impl->xport.disconnect();
+    _impl->ready         = false;
     _impl->connected     = false;
     _impl->streaming     = false;
     _impl->sample_ready  = false;
@@ -518,12 +581,26 @@ void GoGoVernier::close() {
 }
 
 bool GoGoVernier::isConnected() const                { return _impl->connected; }
+bool GoGoVernier::isReady() const                    { return _impl->ready; }
 bool GoGoVernier::isScanning() const                 { return _impl->scanning; }
 void GoGoVernier::abortScan()                        {}
 
 bool GoGoVernier::enableSensor(uint8_t ch) {
     if (ch >= kMaxChannels) return false;
     if (!(_impl->available & (1u << ch))) return false;
+    // Per spec, mutual_exclusion_mask lists other channels that cannot
+    // coexist with this one (e.g. GDX-3MG's low/high range pairs,
+    // GDX-ACC's accel ranges). Strip the self-bit defensively (godirect-py
+    // never sets it, but the firmware-side struct has been seen with
+    // conflicting layouts on third-party gear). Refuse rather than
+    // silently disabling the conflict; caller must disableSensor() first
+    // to make the choice explicit.
+    uint32_t conflict = _impl->channels[ch].mutual_exclusion_mask & ~(1u << ch);
+    if (conflict & _impl->enabled) {
+        log_w("enableSensor(%u) conflicts with enabled mask 0x%08X (mut-ex 0x%08X)",
+              ch, (unsigned)_impl->enabled, (unsigned)conflict);
+        return false;
+    }
     _impl->enabled |= (1u << ch);
     _impl->channels[ch].enabled = true;
     return true;
@@ -654,6 +731,8 @@ float GoGoVernier::measurement(uint8_t ch) const {
     return _impl->channels[ch].value;
 }
 uint32_t GoGoVernier::droppedSamples() const          { return _impl->dropped; }
+
+void GoGoVernier::onSample(SampleCallback cb)        { _impl->on_sample = std::move(cb); }
 
 const DeviceInfo&   GoGoVernier::deviceInfo() const   { return _impl->info; }
 const DeviceStatus& GoGoVernier::status() const       { return _impl->status; }
