@@ -88,8 +88,10 @@ struct GoGoVernier::Impl {
     }
 
     // Build a request frame in `out`. `payload` may be null if `payload_len`
-    // is 0. Returns total frame length. Stamps `pending_rcnt`/`pending_cmd`
-    // so onNotify can match the response.
+    // is 0. Returns total frame length. Does NOT stamp pending_rcnt /
+    // pending_cmd — that happens inside sendRequest under req_mutex so
+    // two tasks racing into encode + sendRequest can't clobber each
+    // other's pending state.
     uint8_t encode(uint8_t* out, uint8_t cmd_id,
                    const uint8_t* payload, uint8_t payload_len) {
         uint8_t total = static_cast<uint8_t>(kFrameHeaderSize + payload_len);
@@ -100,8 +102,6 @@ struct GoGoVernier::Impl {
         out[4] = cmd_id;
         if (payload && payload_len) memcpy(out + 5, payload, payload_len);
         out[3] = calculateChecksum(out, total);
-        pending_rcnt = out[2];
-        pending_cmd  = cmd_id;
         return total;
     }
 
@@ -119,6 +119,15 @@ struct GoGoVernier::Impl {
             SemaphoreHandle_t m;
             ~GiveOnExit() { xSemaphoreGive(m); }
         } _scope { req_mutex };
+
+        // Stamp pending markers under the mutex so concurrent sendRequest
+        // calls don't trample each other's pending_cmd. Previously this
+        // stamping lived in encode(), outside the mutex, which produced
+        // an observed race: thread A's INIT encode ran, then thread B's
+        // SET_PERIOD encode overwrote pending_cmd, then INIT's notify
+        // ack arrived but was dropped as "stale" (cmd mismatch).
+        pending_rcnt = out[2];
+        pending_cmd  = out[4];
 
         // Drain any pending take so we don't accept a stale unblock.
         xSemaphoreTake(resp_sem, 0);
