@@ -105,16 +105,6 @@ struct NimBleXport::Impl {
     bool                        connected   = false;
 };
 
-// Single-conn assumption (Phase 1). Multi-conn (Phase 4) replaces this with
-// a conn_handle → Impl* map.
-static NimBleXport::Impl* g_active_impl = nullptr;
-static void notifyTrampoline(NimBLERemoteCharacteristic* /*chr*/,
-                             uint8_t* data, size_t len, bool /*isNotify*/) {
-    if (g_active_impl && g_active_impl->on_notify) {
-        g_active_impl->on_notify(data, static_cast<uint16_t>(len));
-    }
-}
-
 class TargetFinder : public NimBLEScanCallbacks {
 public:
     TargetFinder(const char* wanted_name, NimBLEUUID service_uuid)
@@ -310,7 +300,6 @@ bool NimBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
           (unsigned)_impl->client->getMTU());
 
     _impl->connected = true;
-    g_active_impl = _impl;
     return true;
 }
 
@@ -320,7 +309,6 @@ void NimBleXport::disconnect() {
         ~GiveOnExit() { if (g_ble_mutex) xSemaphoreGive(g_ble_mutex); }
     } _scope;
 
-    if (g_active_impl == _impl) g_active_impl = nullptr;
     if (_impl->client) {
         if (_impl->client->isConnected()) {
             log_i("disconnect addr=%s", _impl->peer_addr.c_str());
@@ -387,8 +375,29 @@ bool NimBleXport::subscribe(NotifyCb cb) {
         return false;
     }
     _impl->on_notify = std::move(cb);
-    g_active_impl = _impl;
-    bool ok = _impl->rsp_char->subscribe(/*notifications=*/true, notifyTrampoline);
+
+    // Per-instance routing via lambda capture, replacing the old file-
+    // static `g_active_impl` + free-function trampoline. Two reasons:
+    //   1. Multi-device (Phase 4): the global trampoline routed every
+    //      connection's notifications to whichever Impl was bound last,
+    //      silently stealing notifications between instances.
+    //   2. Reduced UAF surface: the lambda's captured `Impl*` becomes
+    //      unreachable when h2zero clears subscriptions inside
+    //      NimBLEDevice::deleteClient (called from disconnect() before
+    //      `delete _impl`), so a notify in flight at teardown can't
+    //      land on a freed pointer the way the global could.
+    // The captured `impl` indirects through `on_notify`, which
+    // unsubscribe() nulls out — so even if h2zero dispatches a
+    // late-queued notification before the subscription is fully torn
+    // down, the lambda no-ops cleanly.
+    Impl* impl = _impl;
+    bool ok = _impl->rsp_char->subscribe(/*notifications=*/true,
+        [impl](NimBLERemoteCharacteristic* /*chr*/,
+               uint8_t* data, size_t len, bool /*isNotify*/) {
+            if (impl && impl->on_notify) {
+                impl->on_notify(data, static_cast<uint16_t>(len));
+            }
+        });
     if (!ok) {
         log_e("subscribe failed");
         return false;
