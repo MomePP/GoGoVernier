@@ -517,6 +517,15 @@ const ChannelInfo* GoGoVernier::channel(uint8_t ch) const {
 
 bool GoGoVernier::start(uint32_t period_ms) {
     if (!_impl->connected) return false;
+    // Refuse if open() handshake hasn't populated available channels yet.
+    // VernierAdapter's idempotent-connect path can return success while
+    // open() is still mid-handshake on another task, and a concurrent
+    // startReading would then send CMD_START_MEASUREMENTS with mask=0
+    // and time out. Block until the handshake has run.
+    if (_impl->available == 0) {
+        log_w("start() refused: handshake incomplete (available mask=0)");
+        return false;
+    }
     if (period_ms) _impl->period_ms = static_cast<uint16_t>(period_ms);
 
     uint8_t buf[64];
