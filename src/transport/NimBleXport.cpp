@@ -113,9 +113,10 @@ struct NimBleXport::Impl {
 static NimBleXport::Impl* g_active_impl = nullptr;
 static void notifyTrampoline(NimBLERemoteCharacteristic* /*chr*/,
                              uint8_t* data, size_t len, bool /*isNotify*/) {
-    Serial.printf("[XPORT] notify rx len=%u op=0x%02X rcnt=0x%02X cksum=0x%02X cmd=0x%02X\r\n",
+    Serial.printf("[XPORT] notify rx len=%u  op=0x%02X b1=0x%02X rcnt=0x%02X cksum=0x%02X cmd=0x%02X\r\n",
                   (unsigned)len,
                   len > 0 ? data[0] : 0,
+                  len > 1 ? data[1] : 0,
                   len > 2 ? data[2] : 0,
                   len > 3 ? data[3] : 0,
                   len > 4 ? data[4] : 0);

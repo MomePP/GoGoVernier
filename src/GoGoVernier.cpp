@@ -151,18 +151,19 @@ struct GoGoVernier::Impl {
         }
 
         // Otherwise it should be a reply to whatever request we last sent.
-        // Validate the rolling counter and echoed cmd_id before unblocking
-        // the waiter — a late ACK to a previously-timed-out request would
-        // otherwise satisfy the next sendRequest with stale bytes.
-        if (pending_rcnt == 0xFFFF || pending_cmd == 0xFFFF) {
-            log_w("notify rx with no pending request (op=0x%02X) — dropped",
-                  data[0]);
+        // Match by echoed cmd_id only — the device does NOT echo the
+        // request's rolling counter back at byte 2 (observed: we send
+        // rcnt=0xFE, device replies rcnt=0x00 regardless). godirect-py's
+        // _GDX_write_and_check_response and GDXLib's D2PIO_ReadBlocking
+        // both skip rcnt validation; mirror that.
+        if (pending_cmd == 0xFFFF) {
+            log_w("notify rx with no pending request (op=0x%02X cmd=0x%02X) — dropped",
+                  data[0], data[4]);
             return;
         }
-        if (data[2] != pending_rcnt || data[4] != pending_cmd) {
-            log_w("stale resp rcnt=0x%02X cmd=0x%02X (want 0x%02X 0x%02X) — dropped",
-                  data[2], data[4],
-                  (unsigned)pending_rcnt, (unsigned)pending_cmd);
+        if (data[4] != pending_cmd) {
+            log_w("stale resp cmd=0x%02X (want 0x%02X) — dropped",
+                  data[4], (unsigned)pending_cmd);
             return;
         }
 
