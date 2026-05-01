@@ -32,8 +32,11 @@ public:
     bool subscribe(NotifyCb cb) override;
     void unsubscribe() override;
 
-    // Public so the .cpp's static notify trampoline + scan callbacks can
-    // touch it. Treat it as a private detail of the translation unit.
+    // Public so the .cpp's ClientCallbacks helper class can touch the
+    // connected flag from onDisconnect(). Treat it as a private detail
+    // of the translation unit. (The pre-Phase-4 file-static notify
+    // trampoline that also needed this is gone — notifications now
+    // route through a per-instance lambda capturing Impl* directly.)
     struct Impl;
 
 private:

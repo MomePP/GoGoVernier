@@ -56,6 +56,9 @@ std::once_flag g_ble_init_flag;
 
 // Serialises the entire connect/disconnect path. NimBLEScan and
 // NimBLEDevice::createClient are non-reentrant for our usage pattern.
+// Recursive so disconnect() can call into unsubscribe() (which now
+// takes the mutex itself for the standalone-unsubscribe case) without
+// deadlocking — see disconnect()'s teardown ordering.
 SemaphoreHandle_t g_ble_mutex = nullptr;
 
 void initBleOnce() {
@@ -72,7 +75,7 @@ void initBleOnce() {
     esp_log_level_set("NimBLEClient", ESP_LOG_INFO);
     esp_log_level_set("NimBLEScan",   ESP_LOG_INFO);
 
-    g_ble_mutex = xSemaphoreCreateMutex();
+    g_ble_mutex = xSemaphoreCreateRecursiveMutex();
 
     // setMTU must run AFTER init: ble_att_set_preferred_mtu only takes
     // effect once the NimBLE host stack is registered. Calling it before
@@ -178,9 +181,9 @@ NimBleXport::~NimBleXport() {
 bool NimBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
     ensureBleInited();
 
-    xSemaphoreTake(g_ble_mutex, portMAX_DELAY);
+    xSemaphoreTakeRecursive(g_ble_mutex, portMAX_DELAY);
     struct GiveOnExit {
-        ~GiveOnExit() { xSemaphoreGive(g_ble_mutex); }
+        ~GiveOnExit() { xSemaphoreGiveRecursive(g_ble_mutex); }
     } _scope;
 
     NimBLEScan* scan = NimBLEDevice::getScan();
@@ -304,10 +307,29 @@ bool NimBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
 }
 
 void NimBleXport::disconnect() {
-    if (g_ble_mutex) xSemaphoreTake(g_ble_mutex, portMAX_DELAY);
+    if (g_ble_mutex) xSemaphoreTakeRecursive(g_ble_mutex, portMAX_DELAY);
     struct GiveOnExit {
-        ~GiveOnExit() { if (g_ble_mutex) xSemaphoreGive(g_ble_mutex); }
+        ~GiveOnExit() { if (g_ble_mutex) xSemaphoreGiveRecursive(g_ble_mutex); }
     } _scope;
+
+    // Tear down in reverse order of connect():
+    //   1. unsubscribe() — nulls on_notify (lambda no-ops on any
+    //      in-flight notify) AND writes CCCD with response so the peer
+    //      stops sending notifications before this call returns.
+    //      h2zero's notify dispatch queue is drained synchronously
+    //      because no new notifications can land after the CCCD ACK.
+    //   2. client->disconnect() + wait — kills the BLE link.
+    //   3. deleteClient — destroys the NimBLEClient and, with it, the
+    //      subscribe-lambda that captured `_impl`. Safe now: the
+    //      lambda is destroyed before `~NimBleXport` later runs
+    //      `delete _impl`, so the captured raw pointer can't outlive
+    //      its target.
+    // Pre-Phase-3.5 ordering nulled on_notify last and relied on
+    //      h2zero's deleteClient to be synchronously notify-quiescent
+    //      — true today, but undocumented by h2zero. The explicit
+    //      unsubscribe at the top makes the ordering load-bearing on
+    //      a contract h2zero does document (CCCD-write-with-response).
+    unsubscribe();
 
     if (_impl->client) {
         if (_impl->client->isConnected()) {
@@ -331,7 +353,6 @@ void NimBleXport::disconnect() {
     _impl->cmd_char = nullptr;
     _impl->rsp_char = nullptr;
     _impl->connected = false;
-    _impl->on_notify = nullptr;
 }
 
 bool NimBleXport::isConnected() const {
@@ -407,8 +428,24 @@ bool NimBleXport::subscribe(NotifyCb cb) {
 }
 
 void NimBleXport::unsubscribe() {
-    if (_impl->rsp_char) _impl->rsp_char->unsubscribe();
+    // Take g_ble_mutex (recursive) so a standalone unsubscribe() from
+    // a caller task can't race with connect() / disconnect() touching
+    // the same characteristic / client. disconnect() also calls this
+    // while already holding the mutex — recursive take is the reason
+    // g_ble_mutex was promoted from non-recursive.
+    if (g_ble_mutex) xSemaphoreTakeRecursive(g_ble_mutex, portMAX_DELAY);
+    struct GiveOnExit {
+        ~GiveOnExit() { if (g_ble_mutex) xSemaphoreGiveRecursive(g_ble_mutex); }
+    } _scope;
+
+    // Clear the indirect-through pointer first so any notification
+    // already in h2zero's dispatch queue at the moment we take the
+    // mutex no-ops in the lambda instead of firing a stale user
+    // callback. The CCCD-write below stops the peer from generating
+    // any further notifications — by the time it returns the queue
+    // is drained.
     _impl->on_notify = nullptr;
+    if (_impl->rsp_char) _impl->rsp_char->unsubscribe();
 }
 
 }  // namespace gogo_vernier
