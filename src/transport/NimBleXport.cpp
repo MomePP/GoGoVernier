@@ -374,6 +374,16 @@ void NimBleXport::disconnect() {
         if (_impl->client->isConnected()) {
             log_i("disconnect addr=%s", _impl->peer_addr.c_str());
             _impl->client->disconnect();
+            // Release g_ble_mutex during the async-disconnect wait.
+            // Phase 4 multi-device: a peer disconnecting takes up to
+            // DISCO_MAX_WAIT_MS for the controller to acknowledge.
+            // Holding the BLE-wide mutex across that window serialises
+            // every other instance's connect/disconnect path through
+            // this one wait, killing throughput when N peers churn at
+            // the same time. The wait only polls the per-client
+            // isConnected() flag — h2zero handles that lock-free, and
+            // the deleteClient call below retakes the mutex.
+            xSemaphoreGiveRecursive(g_ble_mutex);
             const TickType_t kStep = pdMS_TO_TICKS(DISCO_POLL_STEP_MS);
             const TickType_t kMax  = pdMS_TO_TICKS(DISCO_MAX_WAIT_MS);
             TickType_t waited = 0;
@@ -381,6 +391,7 @@ void NimBleXport::disconnect() {
                 vTaskDelay(kStep);
                 waited += kStep;
             }
+            xSemaphoreTakeRecursive(g_ble_mutex, portMAX_DELAY);
         }
         NimBLEDevice::deleteClient(_impl->client);
         _impl->client = nullptr;
