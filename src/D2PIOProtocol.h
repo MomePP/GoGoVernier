@@ -11,20 +11,20 @@
 namespace gogo_vernier {
 
 // BLE GATT identifiers (128-bit, big-endian string form).
-constexpr const char* kGdxServiceUuid       = "d91714ef-28b9-4f91-ba16-f0d9a604f112";
-constexpr const char* kGdxCommandCharUuid   = "f4bf14a6-c7d5-4b6d-8aa8-df1a7c83adcb";
-constexpr const char* kGdxResponseCharUuid  = "b41e6675-a329-40e0-aa01-44d2f444babe";
+constexpr const char* GDX_SERVICE_UUID       = "d91714ef-28b9-4f91-ba16-f0d9a604f112";
+constexpr const char* GDX_COMMAND_CHAR_UUID  = "f4bf14a6-c7d5-4b6d-8aa8-df1a7c83adcb";
+constexpr const char* GDX_RESPONSE_CHAR_UUID = "b41e6675-a329-40e0-aa01-44d2f444babe";
 
 // Frame layout on both characteristics (verbatim from godirect-py
 // `Device._GDX_init` and friends):
-//   byte 0  : kFrameHeader (constant 0x58)
+//   byte 0  : FRAME_HEADER (constant 0x58)
 //   byte 1  : total length in bytes (the entire frame including this byte)
 //   byte 2  : rolling counter — request-side decrements 0xFF..0x00, wraps
 //   byte 3  : checksum (placeholder until calculateChecksum runs)
 //   byte 4  : command id (CMD_ID_*) on writes; response op on reads
 //   byte 5..N-1 : payload, command-specific
-constexpr uint8_t kFrameHeader = 0x58;
-constexpr uint8_t kFrameHeaderSize = 5;  // [magic][len][rcnt][checksum][op]
+constexpr uint8_t FRAME_HEADER      = 0x58;
+constexpr uint8_t FRAME_HEADER_SIZE = 5;  // [magic][len][rcnt][checksum][op]
 
 // Command ids — godirect-py/godirect/device.py
 enum CmdId : uint8_t {
@@ -53,7 +53,7 @@ enum MeasurementType : uint8_t {
 };
 
 // Top-level response opcodes that can appear in byte 3 of an incoming frame.
-constexpr uint8_t kResponseMeasurement = 0x20;
+constexpr uint8_t RESPONSE_MEASUREMENT = 0x20;
 
 enum ChargerState : uint8_t {
     CHARGER_IDLE     = 0,
@@ -64,10 +64,10 @@ enum ChargerState : uint8_t {
 
 // Hard limits dictated by the protocol, not by our implementation.
 //
-// kMaxChannels: GET_SENSOR_AVAILABLE_MASK returns a 32-bit mask. We size every
+// MAX_CHANNELS: GET_SENSOR_AVAILABLE_MASK returns a 32-bit mask. We size every
 // per-channel array to this. The largest GDX device today (GDX-ACC) reports
 // 9 channels; godirect-py iterates 0..31 with the same bound.
-constexpr uint8_t kMaxChannels = 32;
+constexpr uint8_t MAX_CHANNELS = 32;
 
 // Frame checksum, ported byte-for-byte from godirect-py
 // (`Device._GDX_calculate_checksum`):

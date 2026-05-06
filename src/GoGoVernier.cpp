@@ -29,8 +29,33 @@ namespace gogo_vernier {
 
 namespace {
 
-constexpr uint32_t kRequestTimeoutMs = 3000;
-constexpr uint16_t kRespBufSize      = 256;
+// Default response timeout for D2PIO request frames. Most replies land
+// within ~100 ms; CMD_GET_DEVICE_INFO is the outlier (see below).
+constexpr uint32_t REQUEST_TIMEOUT_MS    = 3000;
+
+// CMD_GET_DEVICE_INFO is consistently slow on GDX-LC (4–7 s observed).
+// Use a wider per-call timeout for that one command only.
+constexpr uint32_t DEVICE_INFO_TIMEOUT_MS = 8000;
+
+// Largest response frame we buffer. Sized for CMD_GET_SENSOR_INFO,
+// whose body is 148 bytes after the 6-byte header.
+constexpr uint16_t RESP_BUF_SIZE         =  256;
+
+// Sentinel for pending_rcnt / pending_cmd meaning "no request in
+// flight". u16 so the value can't collide with any valid u8 byte the
+// device might echo at us. Decimal is 65535.
+constexpr uint16_t PENDING_NONE         = 0xFFFF;
+
+// Default sampling period if the host never set one — also used as the
+// initial value of period_ms before start() runs.
+constexpr uint16_t DEFAULT_PERIOD_MS     = 1000;
+
+// Initial value for the rolling counter. godirect-py initialises to
+// 0xFF and decrements on each request, wrapping back to 0xFF after 0x00.
+constexpr uint8_t  INITIAL_ROLLING_COUNTER = 0xFF;
+
+// Rolling counter wrap value (also the sentinel after the wrap branch).
+constexpr uint8_t  ROLLING_COUNTER_WRAP    = 0xFF;
 
 // Deserialise a little-endian unsigned int from `buf[0..N-1]`.
 template <typename T>
@@ -61,23 +86,23 @@ struct GoGoVernier::Impl {
     uint32_t     dropped        = 0;
     uint32_t     available      = 0;
     uint32_t     enabled        = 0;
-    uint16_t     period_ms      = 1000;
+    uint16_t     period_ms      = DEFAULT_PERIOD_MS;
     uint8_t      channel_count  = 0;
-    ChannelInfo  channels[kMaxChannels] = {};
+    ChannelInfo  channels[MAX_CHANNELS] = {};
     DeviceInfo   info           = {};
     DeviceStatus status         = {};
 
     // Protocol state.
-    uint8_t           rolling_counter = 0xFF;
+    uint8_t           rolling_counter = INITIAL_ROLLING_COUNTER;
     SemaphoreHandle_t resp_sem        = nullptr;     // single-shot, given by notify cb
-    uint8_t           resp_buf[kRespBufSize] = {};
+    uint8_t           resp_buf[RESP_BUF_SIZE] = {};
     uint16_t          resp_len        = 0;
     // Stamped by encode() so onNotify() can drop stale responses (the late
     // ACK to a previously-timed-out request must not satisfy the next
-    // sendRequest). Both fields are u16 so the "no pending request"
-    // sentinel 0xFFFF can't collide with a valid u8 byte we might see.
-    uint16_t          pending_rcnt    = 0xFFFF;
-    uint16_t          pending_cmd     = 0xFFFF;
+    // sendRequest). Both fields are u16 so the PENDING_NONE sentinel
+    // (0xFFFF) can't collide with any valid u8 byte we might see.
+    uint16_t          pending_rcnt    = PENDING_NONE;
+    uint16_t          pending_cmd     = PENDING_NONE;
     // Serialises sendRequest. The host MCU can fire C_CONNECT/C_SET_PERIOD
     // on uartHandler while loop()-driven auto-connect is still mid-
     // handshake on the main task; without this, both tasks call encode()
@@ -104,7 +129,7 @@ struct GoGoVernier::Impl {
 
     uint8_t nextRollingCounter() {
         // Pre-decrement, wrap 0x00 → 0xFF, matching godirect-py.
-        if (rolling_counter == 0) rolling_counter = 0xFF;
+        if (rolling_counter == 0) rolling_counter = ROLLING_COUNTER_WRAP;
         else                      --rolling_counter;
         return rolling_counter;
     }
@@ -116,8 +141,8 @@ struct GoGoVernier::Impl {
     // other's pending state.
     uint8_t encode(uint8_t* out, uint8_t cmd_id,
                    const uint8_t* payload, uint8_t payload_len) {
-        uint8_t total = static_cast<uint8_t>(kFrameHeaderSize + payload_len);
-        out[0] = kFrameHeader;
+        uint8_t total = static_cast<uint8_t>(FRAME_HEADER_SIZE + payload_len);
+        out[0] = FRAME_HEADER;
         out[1] = total;
         out[2] = nextRollingCounter();
         out[3] = 0;            // checksum placeholder
@@ -156,17 +181,17 @@ struct GoGoVernier::Impl {
         resp_len = 0;
         if (!xport.write(out, len)) {
             log_e("xport.write failed cmd=0x%02X", out[4]);
-            pending_rcnt = pending_cmd = 0xFFFF;
+            pending_rcnt = pending_cmd = PENDING_NONE;
             return false;
         }
         if (xSemaphoreTake(resp_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
             log_e("response timeout cmd=0x%02X", out[4]);
             // Mark no pending so a late ACK gets dropped rather than
             // satisfying the next sendRequest.
-            pending_rcnt = pending_cmd = 0xFFFF;
+            pending_rcnt = pending_cmd = PENDING_NONE;
             return false;
         }
-        pending_rcnt = pending_cmd = 0xFFFF;
+        pending_rcnt = pending_cmd = PENDING_NONE;
         return true;
     }
 
@@ -176,7 +201,7 @@ struct GoGoVernier::Impl {
         // Measurement frames are pushed by the device unsolicited and at
         // the configured cadence — handle them here, never wake the
         // request semaphore on them.
-        if (data[0] == kResponseMeasurement) {
+        if (data[0] == RESPONSE_MEASUREMENT) {
             decodeMeasurement(data, len);
             return;
         }
@@ -187,7 +212,7 @@ struct GoGoVernier::Impl {
         // rcnt=0xFE, device replies rcnt=0x00 regardless). godirect-py's
         // _GDX_write_and_check_response and GDXLib's D2PIO_ReadBlocking
         // both skip rcnt validation; mirror that.
-        if (pending_cmd == 0xFFFF) {
+        if (pending_cmd == PENDING_NONE) {
             log_w("notify rx with no pending request (op=0x%02X cmd=0x%02X) — dropped",
                   data[0], data[4]);
             return;
@@ -198,10 +223,10 @@ struct GoGoVernier::Impl {
             return;
         }
 
-        if (len > kRespBufSize) {
-            log_w("response truncated %u -> %u", len, (unsigned)kRespBufSize);
+        if (len > RESP_BUF_SIZE) {
+            log_w("response truncated %u -> %u", len, (unsigned)RESP_BUF_SIZE);
         }
-        uint16_t copy_len = len > kRespBufSize ? kRespBufSize : len;
+        uint16_t copy_len = len > RESP_BUF_SIZE ? RESP_BUF_SIZE : len;
         memcpy(resp_buf, data, copy_len);
         resp_len = copy_len;
         xSemaphoreGive(resp_sem);
@@ -239,7 +264,7 @@ struct GoGoVernier::Impl {
             uint8_t sno = data[6];
             count       = data[7];
             idx         = 8;
-            mask        = (sno < kMaxChannels) ? (1u << sno) : 0;
+            mask        = (sno < MAX_CHANNELS) ? (1u << sno) : 0;
             is_real32   = true;
         } else if (meas_type == MEAS_DROPPED && len >= 9) {
             // Device-reported drop notification. Layout per godirect-py
@@ -261,11 +286,14 @@ struct GoGoVernier::Impl {
 
         if (!is_real32 || count == 0 || mask == 0) return;
 
-        // Detect drop: previous sample wasn't drained.
+        // Detect drop: previous sample wasn't drained. Only meaningful
+        // for the polling path — push-mode consumers drain via the
+        // on_sample callback synchronously below, so the sample_ready
+        // flag stays false and this branch never trips spuriously.
         if (sample_ready) ++dropped;
 
         for (uint8_t n = 0; n < count; ++n) {
-            for (uint8_t i = 0; i < kMaxChannels && idx + 4 <= len; ++i) {
+            for (uint8_t i = 0; i < MAX_CHANNELS && idx + 4 <= len; ++i) {
                 if (mask & (1u << i)) {
                     float v;
                     memcpy(&v, data + idx, 4);
@@ -274,7 +302,6 @@ struct GoGoVernier::Impl {
                 }
             }
         }
-        sample_ready = true;
 
         // Push path. Build the dense Sample once and hand off. Iterate
         // `enabled` (not the frame's `mask`) so the layout matches
@@ -283,17 +310,25 @@ struct GoGoVernier::Impl {
         // subset of enabled channels still publish the most recent
         // value for every enabled channel since channels[i].value
         // sticks until the next frame updates it.
+        //
+        // When on_sample is bound, polling-mode sample_ready stays
+        // false: the push consumer is the canonical drain path.
+        // Without this, copySample() never being called would make
+        // the drop-detection branch above trip every single frame
+        // and spuriously inflate droppedSamples().
         if (on_sample) {
             Sample s = {};
             s.enabled_mask = enabled;
             uint8_t k = 0;
-            for (uint8_t i = 0; i < kMaxChannels; ++i) {
+            for (uint8_t i = 0; i < MAX_CHANNELS; ++i) {
                 if (enabled & (1u << i)) {
                     s.values[k++] = channels[i].value;
                 }
             }
             s.count = k;
             on_sample(s);
+        } else {
+            sample_ready = true;
         }
     }
 
@@ -371,7 +406,7 @@ struct GoGoVernier::Impl {
         const uint8_t* dbls  = p + 8 + 60 + 32;  // 3 doubles = 24 bytes
         const uint8_t* tail  = dbls + 24;        // u32 + u64 + u32 + u32 + u32
 
-        if (sensor_no < 0 || sensor_no >= static_cast<int>(kMaxChannels)) {
+        if (sensor_no < 0 || sensor_no >= static_cast<int>(MAX_CHANNELS)) {
             return false;
         }
         ChannelInfo& c = channels[sensor_no];
@@ -460,7 +495,7 @@ bool GoGoVernier::open(const char* name) {
     _impl->status.rssi = static_cast<int8_t>(_impl->xport.rssi());
     _impl->connected   = true;
     _impl->dropped     = 0;
-    _impl->rolling_counter = 0xFF;
+    _impl->rolling_counter = INITIAL_ROLLING_COUNTER;
 
     // ---- D2PIO handshake ----
     uint8_t buf[64];
@@ -476,7 +511,7 @@ bool GoGoVernier::open(const char* name) {
     };
     {
         uint8_t n = _impl->encode(buf, CMD_INIT, kInitPayload, sizeof(kInitPayload));
-        if (!_impl->sendRequest(buf, n, kRequestTimeoutMs)) {
+        if (!_impl->sendRequest(buf, n, REQUEST_TIMEOUT_MS)) {
             log_e("CMD_INIT failed");
             close();
             return false;
@@ -490,7 +525,7 @@ bool GoGoVernier::open(const char* name) {
     // peer name is preserved and downstream channel discovery continues.
     {
         uint8_t n = _impl->encode(buf, CMD_GET_DEVICE_INFO, nullptr, 0);
-        if (!_impl->sendRequest(buf, n, /*timeout_ms=*/8000)) {
+        if (!_impl->sendRequest(buf, n, DEVICE_INFO_TIMEOUT_MS)) {
             log_w("CMD_GET_DEVICE_INFO timed out — keeping advertised name only");
         } else {
             _impl->decodeDeviceInfo();
@@ -502,7 +537,7 @@ bool GoGoVernier::open(const char* name) {
     // CMD_GET_SENSOR_AVAILABLE_MASK
     {
         uint8_t n = _impl->encode(buf, CMD_GET_SENSOR_AVAILABLE_MASK, nullptr, 0);
-        if (!_impl->sendRequest(buf, n, kRequestTimeoutMs)) {
+        if (!_impl->sendRequest(buf, n, REQUEST_TIMEOUT_MS)) {
             log_e("CMD_GET_SENSOR_AVAILABLE_MASK failed");
             close();
             return false;
@@ -517,11 +552,11 @@ bool GoGoVernier::open(const char* name) {
 
     // CMD_GET_SENSOR_INFO(i) for each set bit. Populates channels[].
     _impl->channel_count = 0;
-    for (uint8_t i = 0; i < kMaxChannels; ++i) {
+    for (uint8_t i = 0; i < MAX_CHANNELS; ++i) {
         if (!(_impl->available & (1u << i))) continue;
         uint8_t payload = i;
         uint8_t n = _impl->encode(buf, CMD_GET_SENSOR_INFO, &payload, 1);
-        if (!_impl->sendRequest(buf, n, kRequestTimeoutMs)) {
+        if (!_impl->sendRequest(buf, n, REQUEST_TIMEOUT_MS)) {
             log_w("GET_SENSOR_INFO(%u) failed", i);
             continue;
         }
@@ -540,7 +575,7 @@ bool GoGoVernier::open(const char* name) {
     // bit wins, conflicts stay off. Caller can flip the choice later via
     // disable/enable.
     _impl->enabled = 0;
-    for (uint8_t i = 0; i < kMaxChannels; ++i) {
+    for (uint8_t i = 0; i < MAX_CHANNELS; ++i) {
         if (!(_impl->available & (1u << i))) continue;
         uint32_t conflict = _impl->channels[i].mutual_exclusion_mask & ~(1u << i);
         if (conflict & _impl->enabled) {
@@ -586,7 +621,7 @@ bool GoGoVernier::isScanning() const                 { return _impl->scanning; }
 void GoGoVernier::abortScan()                        {}
 
 bool GoGoVernier::enableSensor(uint8_t ch) {
-    if (ch >= kMaxChannels) return false;
+    if (ch >= MAX_CHANNELS) return false;
     if (!(_impl->available & (1u << ch))) return false;
     // Per spec, mutual_exclusion_mask lists other channels that cannot
     // coexist with this one (e.g. GDX-3MG's low/high range pairs,
@@ -607,7 +642,7 @@ bool GoGoVernier::enableSensor(uint8_t ch) {
 }
 
 bool GoGoVernier::disableSensor(uint8_t ch) {
-    if (ch >= kMaxChannels) return false;
+    if (ch >= MAX_CHANNELS) return false;
     _impl->enabled &= ~(1u << ch);
     _impl->channels[ch].enabled = false;
     return true;
@@ -618,7 +653,7 @@ uint32_t GoGoVernier::enabledChannelMask() const     { return _impl->enabled; }
 uint8_t  GoGoVernier::channelCount() const           { return _impl->channel_count; }
 
 const ChannelInfo* GoGoVernier::channel(uint8_t ch) const {
-    if (ch >= kMaxChannels) return nullptr;
+    if (ch >= MAX_CHANNELS) return nullptr;
     return &_impl->channels[ch];
 }
 
@@ -661,7 +696,7 @@ bool GoGoVernier::start(uint32_t period_ms) {
                                 0, 0, 0, 0 };
         uint8_t n = _impl->encode(buf, CMD_SET_MEASUREMENT_PERIOD,
                                   payload, sizeof(payload));
-        if (!_impl->sendRequest(buf, n, kRequestTimeoutMs)) {
+        if (!_impl->sendRequest(buf, n, REQUEST_TIMEOUT_MS)) {
             log_e("CMD_SET_MEASUREMENT_PERIOD failed");
             return false;
         }
@@ -678,7 +713,7 @@ bool GoGoVernier::start(uint32_t period_ms) {
                                 0, 0, 0, 0, 0, 0, 0, 0 };
         uint8_t n = _impl->encode(buf, CMD_START_MEASUREMENTS,
                                   payload, sizeof(payload));
-        if (!_impl->sendRequest(buf, n, kRequestTimeoutMs)) {
+        if (!_impl->sendRequest(buf, n, REQUEST_TIMEOUT_MS)) {
             log_e("CMD_START_MEASUREMENTS failed");
             return false;
         }
@@ -705,7 +740,7 @@ bool GoGoVernier::stop() {
     // CMD_STOP_MEASUREMENTS — payload [0xFF][0x00][0xFF * 4].
     uint8_t payload[6] = { 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF };
     uint8_t n = _impl->encode(buf, CMD_STOP_MEASUREMENTS, payload, sizeof(payload));
-    bool ok = _impl->sendRequest(buf, n, kRequestTimeoutMs);
+    bool ok = _impl->sendRequest(buf, n, REQUEST_TIMEOUT_MS);
     _impl->streaming = false;
     return ok;
 }
@@ -716,7 +751,7 @@ bool GoGoVernier::sampleReady() const                 { return _impl->sample_rea
 bool GoGoVernier::copySample(float* out, uint8_t& count) {
     if (!_impl->sample_ready) { count = 0; return false; }
     uint8_t idx = 0;
-    for (uint8_t i = 0; i < kMaxChannels; ++i) {
+    for (uint8_t i = 0; i < MAX_CHANNELS; ++i) {
         if (_impl->enabled & (1u << i)) {
             if (out) out[idx] = _impl->channels[i].value;
             ++idx;
@@ -727,7 +762,7 @@ bool GoGoVernier::copySample(float* out, uint8_t& count) {
     return true;
 }
 float GoGoVernier::measurement(uint8_t ch) const {
-    if (ch >= kMaxChannels) return 0.0f;
+    if (ch >= MAX_CHANNELS) return 0.0f;
     return _impl->channels[ch].value;
 }
 uint32_t GoGoVernier::droppedSamples() const          { return _impl->dropped; }

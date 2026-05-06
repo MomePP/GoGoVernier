@@ -21,7 +21,7 @@ public:
 
     // Scan + connect. `name` semantics:
     //   - empty / "proximity"  → highest-RSSI device advertising the GDX
-    //                            service UUID, RSSI > kProximityRssiFloor
+    //                            service UUID, RSSI > PROXIMITY_RSSI_FLOOR
     //   - "GDX-XXX 0123ABCD"   → exact advertised local-name match
     // `scan_timeout_ms` bounds the scan; 0 = library default.
     virtual bool connect(const char* name, uint32_t scan_timeout_ms) = 0;
@@ -41,6 +41,6 @@ public:
 
 // "Proximity" mode RSSI floor (dBm). Devices below this are ignored even if
 // they're the closest match — keeps stray neighbouring devices out.
-constexpr int8_t kProximityRssiFloor = -75;
+constexpr int8_t PROXIMITY_RSSI_FLOOR = -75;
 
 }  // namespace gogo_vernier

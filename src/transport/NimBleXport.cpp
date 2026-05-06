@@ -22,7 +22,7 @@
 //   2. NimBLEScan finds the target device.
 //   3. NimBLEClient::connect(device, deleteAttrs=true, async=false,
 //                            exchangeMTU=false).
-//   4. getService(kGdxServiceUuid) → getCharacteristic(cmd/response).
+//   4. getService(GDX_SERVICE_UUID) → getCharacteristic(cmd/response).
 //   5. response->subscribe(true, cb) wires notifications.
 
 #include "NimBleXport.h"
@@ -49,6 +49,45 @@
 namespace gogo_vernier {
 
 namespace {
+
+// ---- BLE / GATT tunables --------------------------------------------------
+//
+// All timing knobs live here so a future maintainer can tune them in one
+// place. Values were chosen empirically during the Phase-1/2 GDX-LC
+// bring-up; see .claude/knowledges/d2pio-debug-findings.md for the
+// reasoning behind each.
+
+// MTU. Default ATT MTU is 23 bytes → 20-byte single-write payload, too
+// small for the 25-byte CMD_INIT frame. We request 247 (NimBLE max for
+// the bundled host); CMD_INIT only needs ≥ 28 to fit in one ATT write.
+constexpr uint16_t PREFERRED_MTU       = 247;
+constexpr uint16_t DEFAULT_ATT_MTU      =  23;
+constexpr uint16_t MIN_USABLE_MTU       =  28;
+
+// MTU exchange settle. h2zero's exchangeMTU is async — connect() returns
+// before the GATT exchange completes. Poll getMTU() in MTU_POLL_STEP_MS
+// increments up to MTU_FIRST_WAIT_MS; if still at default, fire a manual
+// exchangeMTU and poll up to MTU_RETRY_WAIT_MS more.
+constexpr uint32_t MTU_POLL_STEP_MS      =   50;
+constexpr uint32_t MTU_FIRST_WAIT_MS     = 2000;
+constexpr uint32_t MTU_RETRY_WAIT_MS     = 1500;
+
+// Scan defaults. setInterval / setWindow are in 0.625 ms units per the
+// BLE spec; 100 / 99 means "scan ~62 ms out of every ~62.5 ms" — near
+// 100 % duty cycle, picks up advertisers fast.
+constexpr uint16_t SCAN_INTERVAL_UNITS  =  100;
+constexpr uint16_t SCAN_WINDOW_UNITS    =   99;
+constexpr uint32_t DEFAULT_SCAN_MS      = 5000;
+// Settle delay between scan->stop() and createClient — NimBLE host
+// clears scan-internal flags a few HCI round-trips after stop returns.
+constexpr uint32_t POST_SCAN_SETTLE_MS   =  200;
+
+// Disconnect wait. NimBLEClient::disconnect is async; poll
+// isConnected() in DISCO_POLL_STEP_MS increments up to DISCO_MAX_WAIT_MS.
+constexpr uint32_t DISCO_POLL_STEP_MS    =   20;
+constexpr uint32_t DISCO_MAX_WAIT_MS     =  500;
+
+// ---------------------------------------------------------------------------
 
 // One-time init guarded by std::call_once so two tasks racing into
 // connect() can't both call NimBLEDevice::init().
@@ -84,8 +123,9 @@ void initBleOnce() {
     // 25-byte CMD_INIT then gets truncated by NimBLERemoteValueAttribute::
     // writeValue's long-write fallback and the peripheral drops it.
     NimBLEDevice::init("GoGoVernier");
-    bool mtuOk = NimBLEDevice::setMTU(247);
-    log_i("BLE init done, setMTU(247) -> %s, getMTU()=%u",
+    bool mtuOk = NimBLEDevice::setMTU(PREFERRED_MTU);
+    log_i("BLE init done, setMTU(%u) -> %s, getMTU()=%u",
+          (unsigned)PREFERRED_MTU,
           mtuOk ? "ok" : "FAIL",
           (unsigned)NimBLEDevice::getMTU());
 }
@@ -143,7 +183,7 @@ public:
         if (!match) return;
 
         int rssi = advertised->getRSSI();
-        if (rssi < kProximityRssiFloor) return;
+        if (rssi < PROXIMITY_RSSI_FLOOR) return;
         if (!_best || rssi > _best->getRSSI()) {
             if (_best) delete _best;
             _best = new NimBLEAdvertisedDevice(*advertised);
@@ -191,15 +231,15 @@ bool NimBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
         log_e("NimBLEDevice::getScan() returned NULL");
         return false;
     }
-    NimBLEUUID svc(kGdxServiceUuid);
+    NimBLEUUID svc(GDX_SERVICE_UUID);
     TargetFinder finder(name, svc);
 
     scan->setScanCallbacks(&finder, /*wantDuplicates=*/false);
     scan->setActiveScan(true);
-    scan->setInterval(100);
-    scan->setWindow(99);
+    scan->setInterval(SCAN_INTERVAL_UNITS);
+    scan->setWindow(SCAN_WINDOW_UNITS);
 
-    uint32_t timeout_ms = scan_timeout_ms ? scan_timeout_ms : 5000;
+    uint32_t timeout_ms = scan_timeout_ms ? scan_timeout_ms : DEFAULT_SCAN_MS;
     log_i("scan start name=\"%s\" timeout=%ums", name ? name : "", timeout_ms);
     scan->getResults(timeout_ms, /*is_continue=*/false);
     scan->stop();
@@ -220,7 +260,7 @@ bool NimBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
 
     // Settle delay — NimBLE host clears scan-internal flags a few HCI
     // round-trips after stop() returns.
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(POST_SCAN_SETTLE_MS));
 
     _impl->client = NimBLEDevice::createClient();
     _impl->client->setClientCallbacks(new ClientCallbacks(_impl), /*deleteCallbacks=*/true);
@@ -250,22 +290,21 @@ bool NimBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
     // writeValue truncates the 25-byte CMD_INIT to 20 bytes and the
     // peripheral drops it.
     {
-        const TickType_t kStep = pdMS_TO_TICKS(50);
-        const TickType_t kMax  = pdMS_TO_TICKS(2000);
+        const TickType_t kStep = pdMS_TO_TICKS(MTU_POLL_STEP_MS);
+        const TickType_t kMax  = pdMS_TO_TICKS(MTU_FIRST_WAIT_MS);
         TickType_t waited = 0;
-        while (_impl->client->getMTU() <= 23 && waited < kMax) {
+        while (_impl->client->getMTU() <= DEFAULT_ATT_MTU && waited < kMax) {
             vTaskDelay(kStep);
             waited += kStep;
         }
         uint16_t mtu = _impl->client->getMTU();
-        if (mtu <= 23) {
+        if (mtu <= DEFAULT_ATT_MTU) {
             log_w("MTU still %u after %ums — issuing manual exchangeMTU",
                   (unsigned)mtu, (unsigned)pdTICKS_TO_MS(waited));
             _impl->client->exchangeMTU();
-            // Poll again for up to another 1.5s.
             waited = 0;
-            const TickType_t kMax2 = pdMS_TO_TICKS(1500);
-            while (_impl->client->getMTU() <= 23 && waited < kMax2) {
+            const TickType_t kMax2 = pdMS_TO_TICKS(MTU_RETRY_WAIT_MS);
+            while (_impl->client->getMTU() <= DEFAULT_ATT_MTU && waited < kMax2) {
                 vTaskDelay(kStep);
                 waited += kStep;
             }
@@ -273,22 +312,22 @@ bool NimBleXport::connect(const char* name, uint32_t scan_timeout_ms) {
         }
         log_i("MTU = %u (settle %ums)", (unsigned)mtu,
               (unsigned)pdTICKS_TO_MS(waited));
-        if (mtu < 28) {
-            log_e("MTU %u too small for 25-byte CMD_INIT — handshake will fail",
-                  (unsigned)mtu);
+        if (mtu < MIN_USABLE_MTU) {
+            log_e("MTU %u below MIN_USABLE_MTU=%u — handshake will fail",
+                  (unsigned)mtu, (unsigned)MIN_USABLE_MTU);
         }
     }
 
     NimBLERemoteService* service = _impl->client->getService(svc);
     if (!service) {
-        log_e("GDX service %s not found", kGdxServiceUuid);
+        log_e("GDX service %s not found", GDX_SERVICE_UUID);
         _impl->client->disconnect();
         return false;
     }
     log_d("GDX service discovered");
 
-    _impl->cmd_char = service->getCharacteristic(NimBLEUUID(kGdxCommandCharUuid));
-    _impl->rsp_char = service->getCharacteristic(NimBLEUUID(kGdxResponseCharUuid));
+    _impl->cmd_char = service->getCharacteristic(NimBLEUUID(GDX_COMMAND_CHAR_UUID));
+    _impl->rsp_char = service->getCharacteristic(NimBLEUUID(GDX_RESPONSE_CHAR_UUID));
     if (!_impl->cmd_char || !_impl->rsp_char) {
         log_e("missing characteristic cmd=%p rsp=%p",
               (void*)_impl->cmd_char, (void*)_impl->rsp_char);
@@ -335,8 +374,8 @@ void NimBleXport::disconnect() {
         if (_impl->client->isConnected()) {
             log_i("disconnect addr=%s", _impl->peer_addr.c_str());
             _impl->client->disconnect();
-            const TickType_t kStep = pdMS_TO_TICKS(20);
-            const TickType_t kMax  = pdMS_TO_TICKS(500);
+            const TickType_t kStep = pdMS_TO_TICKS(DISCO_POLL_STEP_MS);
+            const TickType_t kMax  = pdMS_TO_TICKS(DISCO_MAX_WAIT_MS);
             TickType_t waited = 0;
             while (_impl->client->isConnected() && waited < kMax) {
                 vTaskDelay(kStep);

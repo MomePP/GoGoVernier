@@ -22,7 +22,7 @@ namespace gogo_vernier {
 struct Sample {
     uint32_t enabled_mask;
     uint8_t  count;
-    float    values[kMaxChannels];
+    float    values[MAX_CHANNELS];
 };
 
 using SampleCallback = std::function<void(const Sample&)>;
