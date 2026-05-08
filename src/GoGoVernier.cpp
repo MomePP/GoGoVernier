@@ -774,10 +774,38 @@ const DeviceStatus& GoGoVernier::status() const       { return _impl->status; }
 
 bool GoGoVernier::refreshStatus() {
     if (!_impl->connected) return false;
-    // CMD_GET_STATUS isn't in the spec's published opcode list yet (godirect-py
-    // hardcodes its own constant); skip until Phase 3 wires it in. For now
-    // status.rssi can still be refreshed from the live BLE link.
+
+    // Always refresh RSSI from the live BLE link — cheap and doesn't
+    // require a round-trip to the device.
     _impl->status.rssi = static_cast<int8_t>(_impl->xport.rssi());
+
+    // CMD_GET_STATUS = 0x10 (godirect-py CMD_ID_GET_STATUS). Response
+    // layout (after the 6-byte frame header):
+    //   offset  6: status (B)
+    //   offset  7: spare  (B)
+    //   offset  8: primaryCpuMajor (B)
+    //   offset  9: primaryCpuMinor (B)
+    //   offset 10..11: primaryCpuBuild (u16 LE)
+    //   offset 12: secondaryCpuMajor (B)
+    //   offset 13: secondaryCpuMinor (B)
+    //   offset 14..15: secondaryCpuBuild (u16 LE)
+    //   offset 16: batteryLevelPercent (B)
+    //   offset 17: chargerState (B)
+    uint8_t buf[FRAME_HEADER_SIZE];
+    uint8_t n = _impl->encode(buf, CMD_GET_STATUS, nullptr, 0);
+    if (!_impl->sendRequest(buf, n, REQUEST_TIMEOUT_MS)) {
+        log_w("CMD_GET_STATUS timed out — keeping previous battery/charger");
+        return false;
+    }
+    if (_impl->resp_len < 18) {
+        log_w("CMD_GET_STATUS short response (resp_len=%u)", _impl->resp_len);
+        return false;
+    }
+    _impl->status.battery_percent = _impl->resp_buf[16];
+    const uint8_t cs = _impl->resp_buf[17];
+    _impl->status.charger_state = (cs <= static_cast<uint8_t>(CHARGER_ERROR))
+                                      ? static_cast<ChargerState>(cs)
+                                      : CHARGER_ERROR;
     return true;
 }
 

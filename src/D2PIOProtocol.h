@@ -28,6 +28,10 @@ constexpr uint8_t FRAME_HEADER_SIZE = 5;  // [magic][len][rcnt][checksum][op]
 
 // Command ids — godirect-py/godirect/device.py
 enum CmdId : uint8_t {
+    // Opcode 0x10 isn't in Vernier's published spec; godirect-py
+    // hardcodes it as CMD_ID_GET_STATUS. Response carries status +
+    // CPU versions + battery percent + charger state.
+    CMD_GET_STATUS                 = 0x10,
     CMD_START_MEASUREMENTS         = 0x18,
     CMD_STOP_MEASUREMENTS          = 0x19,
     CMD_INIT                       = 0x1A,
