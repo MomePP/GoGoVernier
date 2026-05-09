@@ -16,8 +16,9 @@
 // NimBLE host (no vendored stack) — same blob version as the BT
 // controller, no version-skew failure mode.
 //
-// Connection model (one connection per NimBleXport instance for now —
-// multi-conn lands in Phase 4):
+// Connection model — one BLE connection per NimBleXport instance,
+// multiple instances coexist on a single controller (notifications
+// route per-session via lambda capture, see subscribe() below):
 //   1. NimBLEDevice::init() — process-wide, idempotent.
 //   2. NimBLEScan finds the target device.
 //   3. NimBLEClient::connect(device, deleteAttrs=true, async=false,
@@ -375,12 +376,12 @@ void NimBleXport::disconnect() {
             log_i("disconnect addr=%s", _impl->peer_addr.c_str());
             _impl->client->disconnect();
             // Release g_ble_mutex during the async-disconnect wait.
-            // Phase 4 multi-device: a peer disconnecting takes up to
-            // DISCO_MAX_WAIT_MS for the controller to acknowledge.
-            // Holding the BLE-wide mutex across that window serialises
-            // every other instance's connect/disconnect path through
-            // this one wait, killing throughput when N peers churn at
-            // the same time. The wait only polls the per-client
+            // A peer disconnecting takes up to DISCO_MAX_WAIT_MS for
+            // the controller to acknowledge. Holding the BLE-wide
+            // mutex across that window serialises every other
+            // instance's connect/disconnect path through this one
+            // wait, killing throughput when N peers churn at the
+            // same time. The wait only polls the per-client
             // isConnected() flag — h2zero handles that lock-free, and
             // the deleteClient call below retakes the mutex.
             xSemaphoreGiveRecursive(g_ble_mutex);
@@ -449,7 +450,7 @@ bool NimBleXport::subscribe(NotifyCb cb) {
 
     // Per-instance routing via lambda capture, replacing the old file-
     // static `g_active_impl` + free-function trampoline. Two reasons:
-    //   1. Multi-device (Phase 4): the global trampoline routed every
+    //   1. Multi-device safety: the global trampoline routed every
     //      connection's notifications to whichever Impl was bound last,
     //      silently stealing notifications between instances.
     //   2. Reduced UAF surface: the lambda's captured `Impl*` becomes

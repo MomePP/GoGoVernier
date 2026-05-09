@@ -1,11 +1,12 @@
-// GoGoVernier — Phase 2.
+// GoGoVernier — D2PIO session implementation.
 //
-// open() connects + subscribes (Phase 1) and then performs the D2PIO setup
-// handshake: INIT → GET_DEVICE_INFO → GET_SENSOR_AVAILABLE_MASK →
-// GET_SENSOR_INFO(i) for each set bit. start() / stop() send
-// SET_MEASUREMENT_PERIOD + START_MEASUREMENTS / STOP_MEASUREMENTS, and
-// the notify callback decodes RESPONSE_MEASUREMENT frames live into
-// _channels[].value with sample_ready bookkeeping.
+// open() runs the full D2PIO setup handshake: BLE connect + subscribe →
+// INIT → GET_DEVICE_INFO → GET_SENSOR_AVAILABLE_MASK → GET_SENSOR_INFO(i)
+// for each set bit. start() / stop() send SET_MEASUREMENT_PERIOD +
+// START / STOP_MEASUREMENTS. The notify callback decodes
+// RESPONSE_MEASUREMENT frames live into _channels[].value, raises
+// sample_ready, and fires the optional onSample push callback.
+// refreshStatus() queries CMD_GET_STATUS for battery + charger state.
 //
 // Frame layout cross-checked against VernierST/godirect-py
 // (BSD-3, © 2024 Vernier Science Education):
@@ -13,8 +14,10 @@
 //   response: [op  ][len][rcnt][checksum][cmd_id|meas_type][payload...]
 //
 // Synchronisation between sendRequest() and the notify-rx callback is a
-// single-shot binary semaphore + a copy buffer. Multi-device (Phase 4)
-// will key this off conn_handle.
+// single-shot binary semaphore + a copy buffer, scoped to this Impl.
+// Multi-device runs as N independent instances — transport routes
+// notifications per-session via lambda capture in NimBleXport, so this
+// file holds no shared state across peers.
 
 #include "GoGoVernier.h"
 
@@ -368,9 +371,11 @@ struct GoGoVernier::Impl {
             uint8_t minor1             = p[71];
             uint8_t major2             = p[74];
             uint8_t minor2             = p[75];
-            // Pack as (major << 8) | minor — the build numbers (u16 each)
-            // are dropped on the floor for now. Phase 3 widens DeviceInfo
-            // to expose them as full strings.
+            // Pack as (major << 8) | minor. Build numbers (u16 each
+            // following minor) are intentionally dropped — DeviceInfo
+            // exposes only the major.minor pair today; widen to a
+            // string field if a downstream consumer ever needs the
+            // full version triplet.
             info.primary_cpu_version   = static_cast<uint16_t>((major1 << 8) | minor1);
             info.secondary_cpu_version = static_cast<uint16_t>((major2 << 8) | minor2);
         }

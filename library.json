@@ -1,6 +1,6 @@
 {
   "name": "GoGoVernier",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "description": "Clean-room Vernier Go Direct (D2PIO) BLE driver for the GoGo Board 7 ESP32-C3 co-processor. NimBLE-backed, multi-device, full 32-channel support. Derived from VernierST/godirect-py and Vernier-Science-Education/GDXLib (BSD-3).",
   "keywords": "vernier, go direct, gdx, ble, nimble, esp32, gogoboard",
   "license": "BSD-3-Clause",

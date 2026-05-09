@@ -1,11 +1,13 @@
 // GoGoVernier — Vernier Go Direct (D2PIO) BLE client for GoGo Board 7.
 //
-// Phase 0 skeleton. Public API only — no implementation yet. The shape mirrors
-// what `vernier-firmware/src/vernier-adapter.cpp` consumes today against
-// MomePP/GDXLib, with the multi-device + 32-channel goals from
-// .claude/plans/gdxlib-rewrite.md baked in from the start.
+// NimBLE-backed driver with full D2PIO handshake, live measurement
+// decode, push-style sample callback, multi-device session routing, and
+// battery / charger readout via CMD_GET_STATUS. One instance per
+// concurrent peer; transport routes notifications via per-instance
+// lambda so multiple sessions coexist on a single BLE controller.
 //
-// See NOTICES.md for upstream attribution.
+// See README.md for the capability summary, NOTICES.md for upstream
+// attribution.
 
 #pragma once
 
