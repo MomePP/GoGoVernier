@@ -364,11 +364,10 @@ void NimBleXport::disconnect() {
     //      lambda is destroyed before `~NimBleXport` later runs
     //      `delete _impl`, so the captured raw pointer can't outlive
     //      its target.
-    // Pre-Phase-3.5 ordering nulled on_notify last and relied on
-    //      h2zero's deleteClient to be synchronously notify-quiescent
-    //      — true today, but undocumented by h2zero. The explicit
-    //      unsubscribe at the top makes the ordering load-bearing on
-    //      a contract h2zero does document (CCCD-write-with-response).
+    // The explicit unsubscribe at the top keeps the ordering load-
+    // bearing on a contract h2zero documents (CCCD-write-with-response)
+    // rather than the undocumented "deleteClient is notify-quiescent"
+    // side-effect.
     unsubscribe();
 
     if (_impl->client) {
@@ -448,16 +447,14 @@ bool NimBleXport::subscribe(NotifyCb cb) {
     }
     _impl->on_notify = std::move(cb);
 
-    // Per-instance routing via lambda capture, replacing the old file-
-    // static `g_active_impl` + free-function trampoline. Two reasons:
-    //   1. Multi-device safety: the global trampoline routed every
-    //      connection's notifications to whichever Impl was bound last,
-    //      silently stealing notifications between instances.
+    // Per-instance routing via lambda capture. Two properties matter:
+    //   1. Multi-device safety: each session's notifications dispatch
+    //      to its own Impl, not to a process-wide last-bound global.
     //   2. Reduced UAF surface: the lambda's captured `Impl*` becomes
     //      unreachable when h2zero clears subscriptions inside
     //      NimBLEDevice::deleteClient (called from disconnect() before
     //      `delete _impl`), so a notify in flight at teardown can't
-    //      land on a freed pointer the way the global could.
+    //      land on a freed pointer.
     // The captured `impl` indirects through `on_notify`, which
     // unsubscribe() nulls out — so even if h2zero dispatches a
     // late-queued notification before the subscription is fully torn

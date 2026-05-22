@@ -34,9 +34,8 @@ public:
 
     // Public so the .cpp's ClientCallbacks helper class can touch the
     // connected flag from onDisconnect(). Treat it as a private detail
-    // of the translation unit. (The pre-Phase-4 file-static notify
-    // trampoline that also needed this is gone — notifications now
-    // route through a per-instance lambda capturing Impl* directly.)
+    // of the translation unit — notifications route through a per-
+    // instance lambda capturing Impl* directly (see subscribe()).
     struct Impl;
 
 private:

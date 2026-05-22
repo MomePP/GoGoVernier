@@ -41,7 +41,7 @@ constexpr uint32_t REQUEST_TIMEOUT_MS    = 3000;
 constexpr uint32_t DEVICE_INFO_TIMEOUT_MS = 8000;
 
 // Largest response frame we buffer. Sized for CMD_GET_SENSOR_INFO,
-// whose body is 148 bytes after the 6-byte header.
+// whose body is SENSOR_INFO_BODY_SIZE (148 B) after FRAME_BODY_OFFSET.
 constexpr uint16_t RESP_BUF_SIZE         =  256;
 
 // Sentinel for pending_rcnt / pending_cmd meaning "no request in
@@ -60,6 +60,30 @@ constexpr uint8_t  INITIAL_ROLLING_COUNTER = 0xFF;
 // Rolling counter wrap value (also the sentinel after the wrap branch).
 constexpr uint8_t  ROLLING_COUNTER_WRAP    = 0xFF;
 
+// Microseconds-per-millisecond conversion for SET_MEASUREMENT_PERIOD,
+// whose wire payload carries period_us as a u32 LE.
+constexpr uint32_t US_PER_MS               = 1000;
+
+// Extra slack added on top of the per-call response timeout when taking
+// req_mutex. Lets the contended-caller wait long enough for the
+// in-flight request's own timeout to fire and release the mutex.
+constexpr uint32_t REQ_MUTEX_GRACE_MS      = 1000;
+
+// Pre-handshake scan timeout. open() runs a single discovery pass
+// before the BLE connect — 5 s catches GDX advertisers (advertise
+// every ~100 ms) without keeping the radio busy for unconnected hosts.
+constexpr uint32_t OPEN_SCAN_MS            = 5000;
+
+// Compiler-only memory barrier for cross-task publication on a
+// single-core RISC-V MCU (ESP32-C3). Forces the compiler to emit all
+// preceding writes before any following store/load so a notify-task
+// "sample ready" flag can't be observed before its data writes. No
+// hardware fence is needed: there's only one core, FreeRTOS context
+// switches insert their own kernel barriers, and the Xtensa `memw`
+// instruction wouldn't assemble here. Use this exact form to stay
+// consistent with vernier-firmware/src/main.cpp.
+#define VERNIER_CROSS_TASK_BARRIER() __asm__ volatile("" ::: "memory")
+
 // Deserialise a little-endian unsigned int from `buf[0..N-1]`.
 template <typename T>
 T leUnpack(const uint8_t* buf) {
@@ -76,24 +100,34 @@ struct GoGoVernier::Impl {
     NimBleXport xport;
 
     // Connection / streaming state.
-    bool         connected      = false;
+    bool              connected      = false;
     // Set true only after open() finishes the full D2PIO handshake
     // (INIT, DEVICE_INFO, AVAILABLE_MASK, SENSOR_INFO×N) and the
     // channel array is populated. `connected` flips earlier (right
     // after the BLE link is up) which is too soon for callers to
     // start streaming.
-    bool         ready          = false;
-    bool         scanning       = false;
-    bool         streaming      = false;
-    bool         sample_ready   = false;
-    uint32_t     dropped        = 0;
-    uint32_t     available      = 0;
-    uint32_t     enabled        = 0;
-    uint16_t     period_ms      = DEFAULT_PERIOD_MS;
-    uint8_t      channel_count  = 0;
-    ChannelInfo  channels[MAX_CHANNELS] = {};
-    DeviceInfo   info           = {};
-    DeviceStatus status         = {};
+    bool              ready          = false;
+    bool              scanning       = false;
+    bool              streaming      = false;
+    // Cross-task flag: written by the NimBLE notify task in
+    // decodeMeasurement(), read+cleared by the caller task in
+    // copySample(). volatile prevents the compiler from caching a
+    // polled read in a register. A compiler barrier in
+    // decodeMeasurement() ensures all channels[].value stores complete
+    // before the flag flips — see VERNIER_CROSS_TASK_BARRIER().
+    volatile bool     sample_ready   = false;
+    // Cross-task counter: incremented from the notify task on drop
+    // (both the local "previous sample not drained" path and the
+    // device-reported MEAS_DROPPED tally), read from caller tasks via
+    // droppedSamples().
+    volatile uint32_t dropped        = 0;
+    uint32_t          available      = 0;
+    uint32_t          enabled        = 0;
+    uint16_t          period_ms      = DEFAULT_PERIOD_MS;
+    uint8_t           channel_count  = 0;
+    ChannelInfo       channels[MAX_CHANNELS] = {};
+    DeviceInfo        info           = {};
+    DeviceStatus      status         = {};
 
     // Protocol state.
     uint8_t           rolling_counter = INITIAL_ROLLING_COUNTER;
@@ -161,7 +195,8 @@ struct GoGoVernier::Impl {
     // semaphore for a real reply.
     bool sendRequest(const uint8_t* out, uint8_t len, uint32_t timeout_ms) {
         // One in-flight request at a time, no matter which task called us.
-        if (xSemaphoreTake(req_mutex, pdMS_TO_TICKS(timeout_ms + 1000)) != pdTRUE) {
+        if (xSemaphoreTake(req_mutex,
+                           pdMS_TO_TICKS(timeout_ms + REQ_MUTEX_GRACE_MS)) != pdTRUE) {
             log_e("req_mutex contended cmd=0x%02X", out[4]);
             return false;
         }
@@ -277,9 +312,10 @@ struct GoGoVernier::Impl {
             // Add to the local drop counter — distinct from our
             // "previous sample wasn't drained" path above; both feed the
             // same droppedSamples() accessor since the host only cares
-            // about the aggregate.
+            // about the aggregate. Explicit load+store to side-step the
+            // C++20 `-Wdeprecated-volatile` on compound assignment.
             uint16_t drop_count = leUnpack<uint16_t>(data + 7);
-            dropped += drop_count;
+            dropped = static_cast<uint32_t>(dropped) + drop_count;
             log_w("device-reported %u dropped samples (mask=0x%04X)",
                   drop_count, leUnpack<uint16_t>(data + 5));
             return;
@@ -293,15 +329,15 @@ struct GoGoVernier::Impl {
         // for the polling path — push-mode consumers drain via the
         // on_sample callback synchronously below, so the sample_ready
         // flag stays false and this branch never trips spuriously.
-        if (sample_ready) ++dropped;
+        if (sample_ready) dropped = static_cast<uint32_t>(dropped) + 1;
 
         for (uint8_t n = 0; n < count; ++n) {
-            for (uint8_t i = 0; i < MAX_CHANNELS && idx + 4 <= len; ++i) {
+            for (uint8_t i = 0; i < MAX_CHANNELS && idx + sizeof(float) <= len; ++i) {
                 if (mask & (1u << i)) {
                     float v;
-                    memcpy(&v, data + idx, 4);
+                    memcpy(&v, data + idx, sizeof(float));
                     channels[i].value = v;
-                    idx += 4;
+                    idx += sizeof(float);
                 }
             }
         }
@@ -320,6 +356,9 @@ struct GoGoVernier::Impl {
         // the drop-detection branch above trip every single frame
         // and spuriously inflate droppedSamples().
         if (on_sample) {
+            // Push path. The callback typically forwards into a
+            // FreeRTOS queue whose xQueueSend acts as the publication
+            // barrier — no explicit fence needed here.
             Sample s = {};
             s.enabled_mask = enabled;
             uint8_t k = 0;
@@ -331,46 +370,49 @@ struct GoGoVernier::Impl {
             s.count = k;
             on_sample(s);
         } else {
+            // Polling path. Force the channels[].value stores above to
+            // commit before the consumer-observed flag flips, otherwise
+            // a copySample() racing the notify task on a single core
+            // could read sample_ready=true and a not-yet-updated value.
+            VERNIER_CROSS_TASK_BARRIER();
             sample_ready = true;
         }
     }
 
-    // Decode CMD_GET_DEVICE_INFO response. godirect-py struct (after
-    // skipping the 6-byte header):
-    //   16s OrderCode      offset 0
-    //   16s SerialNumber   offset 16
-    //   32s DeviceName     offset 32
-    //    H  manufacturerId offset 64  (2 bytes, LE)
-    //    H  manufactYear   offset 66
-    //    B  month          offset 68
-    //    B  day            offset 69
-    //    BBH primary CPU   offset 70  (major, minor, build u16)
-    //    BBH secondary CPU offset 74
-    //    BBBBBB ble addr   offset 78  (6 bytes, reverse order)
-    //    I  NVRAM size     offset 84
-    //    64s description   offset 88
+    // Decode CMD_GET_DEVICE_INFO response. Byte layout next to the
+    // DEV_INFO_* constants in D2PIOProtocol.h.
     void decodeDeviceInfo() {
-        if (resp_len < 6 + 64) return;  // need at least the strings
-        const uint8_t* p = resp_buf + 6;
+        if (resp_len < FRAME_BODY_OFFSET + DEV_INFO_BODY_MIN_SIZE) return;
+        const uint8_t* p = resp_buf + FRAME_BODY_OFFSET;
         memset(info.order_code, 0, sizeof(info.order_code));
         memset(info.serial,     0, sizeof(info.serial));
         memset(info.name,       0, sizeof(info.name));
-        memcpy(info.order_code, p,             16);
-        info.order_code[15] = '\0';
-        memcpy(info.serial,     p + 16,        16);
-        info.serial[15]     = '\0';
-        memcpy(info.name,       p + 32,        sizeof(info.name) - 1);
+        static_assert(sizeof(info.order_code) >= DEV_INFO_ORDER_CODE_LEN,
+                      "info.order_code must fit the on-wire field");
+        static_assert(sizeof(info.serial)     >= DEV_INFO_SERIAL_LEN,
+                      "info.serial must fit the on-wire field");
+        memcpy(info.order_code, p + DEV_INFO_OFF_ORDER_CODE, DEV_INFO_ORDER_CODE_LEN);
+        info.order_code[sizeof(info.order_code) - 1] = '\0';
+        memcpy(info.serial, p + DEV_INFO_OFF_SERIAL, DEV_INFO_SERIAL_LEN);
+        info.serial[sizeof(info.serial) - 1] = '\0';
+        // info.name is the same width as the wire field today; copy
+        // one fewer byte so the NUL terminator we set below always
+        // wins even if the wire string is unterminated.
+        memcpy(info.name, p + DEV_INFO_OFF_NAME,
+               sizeof(info.name) > DEV_INFO_NAME_LEN
+                   ? DEV_INFO_NAME_LEN
+                   : sizeof(info.name) - 1);
         info.name[sizeof(info.name) - 1] = '\0';
 
         // The rest of the response is optional — only populate what we
         // have bytes for, in case some firmware variants ship a shorter
         // struct.
-        if (resp_len >= 6 + 78) {
-            info.vid                   = leUnpack<uint16_t>(p + 64);
-            uint8_t major1             = p[70];
-            uint8_t minor1             = p[71];
-            uint8_t major2             = p[74];
-            uint8_t minor2             = p[75];
+        if (resp_len >= FRAME_BODY_OFFSET + DEV_INFO_BODY_EXT_SIZE) {
+            info.vid       = leUnpack<uint16_t>(p + DEV_INFO_OFF_VID);
+            uint8_t major1 = p[DEV_INFO_OFF_PRIMARY_CPU];
+            uint8_t minor1 = p[DEV_INFO_OFF_PRIMARY_CPU + 1];
+            uint8_t major2 = p[DEV_INFO_OFF_SECONDARY_CPU];
+            uint8_t minor2 = p[DEV_INFO_OFF_SECONDARY_CPU + 1];
             // Pack as (major << 8) | minor. Build numbers (u16 each
             // following minor) are intentionally dropped — DeviceInfo
             // exposes only the major.minor pair today; widen to a
@@ -387,29 +429,28 @@ struct GoGoVernier::Impl {
 
     // Decode CMD_GET_SENSOR_AVAILABLE_MASK / CMD_GET_DEFAULT_SENSORS_MASK.
     // godirect-py: `mask = struct.unpack("<I", response[6:])[0]` — a
-    // single u32 LE in the body.
+    // single u32 LE at the start of the body.
     bool decodeMask(uint32_t* out_mask) {
-        if (resp_len < 6 + 4) return false;
-        *out_mask = leUnpack<uint32_t>(resp_buf + 6);
+        if (resp_len < FRAME_BODY_OFFSET + SENSOR_MASK_BODY_SIZE) return false;
+        *out_mask = leUnpack<uint32_t>(resp_buf + FRAME_BODY_OFFSET);
         return true;
     }
 
-    // Decode CMD_GET_SENSOR_INFO response. struct:
-    //   "<bBIBB60s32sdddIQIII"
-    // Total decoded body = 1+1+4+1+1+60+32+8+8+8+4+8+4+4+4 = 148 bytes
-    // after the 6-byte header.
+    // Decode CMD_GET_SENSOR_INFO response. Field offsets are
+    // SENSOR_INFO_OFF_* in D2PIOProtocol.h; total body width is
+    // SENSOR_INFO_BODY_SIZE (148 B).
     bool decodeSensorInfo() {
-        if (resp_len < 6 + 148) return false;
-        const uint8_t* p = resp_buf + 6;
+        if (resp_len < FRAME_BODY_OFFSET + SENSOR_INFO_BODY_SIZE) return false;
+        const uint8_t* p = resp_buf + FRAME_BODY_OFFSET;
         int8_t   sensor_no   = static_cast<int8_t>(p[0]);
         // p[1] = spare
         uint32_t sensor_id   = leUnpack<uint32_t>(p + 2);
         uint8_t  meas_type   = p[6];
         uint8_t  sampling    = p[7];
-        const uint8_t* desc  = p + 8;            // 60 bytes
-        const uint8_t* units = p + 8 + 60;       // 32 bytes
-        const uint8_t* dbls  = p + 8 + 60 + 32;  // 3 doubles = 24 bytes
-        const uint8_t* tail  = dbls + 24;        // u32 + u64 + u32 + u32 + u32
+        const uint8_t* desc  = p + SENSOR_INFO_OFF_DESC;
+        const uint8_t* units = p + SENSOR_INFO_OFF_UNITS;
+        const uint8_t* dbls  = p + SENSOR_INFO_OFF_DBLS;
+        const uint8_t* tail  = p + SENSOR_INFO_OFF_TAIL;
 
         if (sensor_no < 0 || sensor_no >= static_cast<int>(MAX_CHANNELS)) {
             return false;
@@ -422,28 +463,38 @@ struct GoGoVernier::Impl {
         memset(c.description, 0, sizeof(c.description));
         memset(c.units,       0, sizeof(c.units));
         memcpy(c.description, desc,
-               sizeof(c.description) > 60 ? 60 : sizeof(c.description) - 1);
+               sizeof(c.description) > SENSOR_INFO_DESC_LEN
+                   ? SENSOR_INFO_DESC_LEN
+                   : sizeof(c.description) - 1);
         c.description[sizeof(c.description) - 1] = '\0';
         memcpy(c.units, units,
-               sizeof(c.units) > 32 ? 32 : sizeof(c.units) - 1);
+               sizeof(c.units) > SENSOR_INFO_UNITS_LEN
+                   ? SENSOR_INFO_UNITS_LEN
+                   : sizeof(c.units) - 1);
         c.units[sizeof(c.units) - 1] = '\0';
 
         // doubles: uncertainty, min, max — narrow to f32 for the channel
         // struct (existing API contract).
         double d;
-        memcpy(&d, dbls + 0,  8); c.measurement_uncertainty = static_cast<float>(d);
-        memcpy(&d, dbls + 8,  8); c.min_measurement         = static_cast<float>(d);
-        memcpy(&d, dbls + 16, 8); c.max_measurement         = static_cast<float>(d);
+        constexpr size_t kDbl = sizeof(double);
+        memcpy(&d, dbls + 0 * kDbl, kDbl); c.measurement_uncertainty = static_cast<float>(d);
+        memcpy(&d, dbls + 1 * kDbl, kDbl); c.min_measurement         = static_cast<float>(d);
+        memcpy(&d, dbls + 2 * kDbl, kDbl); c.max_measurement         = static_cast<float>(d);
 
-        // <IQIII> after the doubles. The Q is 8 bytes.
-        c.min_period_us           = leUnpack<uint32_t>(tail + 0);
-        // skip Q (max_period_us is 64-bit on the wire; clamp to u32)
-        uint64_t maxp = leUnpack<uint64_t>(tail + 4);
-        c.max_period_us           = (maxp > 0xFFFFFFFFu) ? 0xFFFFFFFFu
-                                                          : static_cast<uint32_t>(maxp);
-        c.typ_period_us           = leUnpack<uint32_t>(tail + 12);
-        c.period_granularity_us   = leUnpack<uint32_t>(tail + 16);
-        c.mutual_exclusion_mask   = leUnpack<uint32_t>(tail + 20);
+        // Tail layout: <IQIII> — u32 min_period, u64 max_period,
+        // u32 typ_period, u32 period_granularity, u32 mut_excl_mask.
+        constexpr uint8_t kTailMinPeriod  = 0;
+        constexpr uint8_t kTailMaxPeriod  = kTailMinPeriod  + sizeof(uint32_t);
+        constexpr uint8_t kTailTypPeriod  = kTailMaxPeriod  + sizeof(uint64_t);
+        constexpr uint8_t kTailGranPeriod = kTailTypPeriod  + sizeof(uint32_t);
+        constexpr uint8_t kTailMutExMask  = kTailGranPeriod + sizeof(uint32_t);
+        c.min_period_us         = leUnpack<uint32_t>(tail + kTailMinPeriod);
+        uint64_t maxp           = leUnpack<uint64_t>(tail + kTailMaxPeriod);
+        c.max_period_us         = (maxp > 0xFFFFFFFFu) ? 0xFFFFFFFFu
+                                                       : static_cast<uint32_t>(maxp);
+        c.typ_period_us         = leUnpack<uint32_t>(tail + kTailTypPeriod);
+        c.period_granularity_us = leUnpack<uint32_t>(tail + kTailGranPeriod);
+        c.mutual_exclusion_mask = leUnpack<uint32_t>(tail + kTailMutExMask);
         return true;
     }
 };
@@ -475,9 +526,8 @@ bool GoGoVernier::open(const char* name) {
 
     if (_impl->connected) close();
 
-    constexpr uint32_t kScanMs = 5000;
     log_i("open name=\"%s\"", name ? name : "");
-    if (!_impl->xport.connect(name, kScanMs)) {
+    if (!_impl->xport.connect(name, OPEN_SCAN_MS)) {
         log_e("open failed (no peer or connect rejected)");
         return false;
     }
@@ -503,7 +553,7 @@ bool GoGoVernier::open(const char* name) {
     _impl->rolling_counter = INITIAL_ROLLING_COUNTER;
 
     // ---- D2PIO handshake ----
-    uint8_t buf[64];
+    uint8_t buf[MAX_REQUEST_FRAME_SIZE];
 
     // CMD_INIT — godirect-py sends a 25-byte literal payload. The exact
     // sequence is opaque (likely a vendor handshake) but stable.
@@ -688,17 +738,20 @@ bool GoGoVernier::start(uint32_t period_ms) {
     }
     if (period_ms) _impl->period_ms = static_cast<uint16_t>(period_ms);
 
-    uint8_t buf[64];
+    uint8_t buf[MAX_REQUEST_FRAME_SIZE];
 
-    // CMD_SET_MEASUREMENT_PERIOD — payload = [0xFF][0x00][u32 period_us LE].
+    // CMD_SET_MEASUREMENT_PERIOD — see REQ_PAYLOAD_SET_PERIOD_SIZE layout
+    // beside the constant in D2PIOProtocol.h.
     {
-        uint32_t period_us = static_cast<uint32_t>(_impl->period_ms) * 1000u;
-        uint8_t payload[10] = { 0xFF, 0x00,
-                                static_cast<uint8_t>((period_us >> 0)  & 0xFF),
-                                static_cast<uint8_t>((period_us >> 8)  & 0xFF),
-                                static_cast<uint8_t>((period_us >> 16) & 0xFF),
-                                static_cast<uint8_t>((period_us >> 24) & 0xFF),
-                                0, 0, 0, 0 };
+        uint32_t period_us = static_cast<uint32_t>(_impl->period_ms) * US_PER_MS;
+        uint8_t payload[REQ_PAYLOAD_SET_PERIOD_SIZE] = {
+            REQ_FLAG_DEVICE_WIDE, REQ_SEL_SET_PERIOD,
+            static_cast<uint8_t>((period_us >>  0) & 0xFF),
+            static_cast<uint8_t>((period_us >>  8) & 0xFF),
+            static_cast<uint8_t>((period_us >> 16) & 0xFF),
+            static_cast<uint8_t>((period_us >> 24) & 0xFF),
+            0, 0, 0, 0
+        };
         uint8_t n = _impl->encode(buf, CMD_SET_MEASUREMENT_PERIOD,
                                   payload, sizeof(payload));
         if (!_impl->sendRequest(buf, n, REQUEST_TIMEOUT_MS)) {
@@ -707,15 +760,18 @@ bool GoGoVernier::start(uint32_t period_ms) {
         }
     }
 
-    // CMD_START_MEASUREMENTS — payload = [0xFF][0x01][u32 mask LE][8 zero bytes].
+    // CMD_START_MEASUREMENTS — see REQ_PAYLOAD_START_MEAS_SIZE layout
+    // beside the constant in D2PIOProtocol.h.
     {
         uint32_t mask = _impl->enabled;
-        uint8_t payload[14] = { 0xFF, 0x01,
-                                static_cast<uint8_t>((mask >> 0)  & 0xFF),
-                                static_cast<uint8_t>((mask >> 8)  & 0xFF),
-                                static_cast<uint8_t>((mask >> 16) & 0xFF),
-                                static_cast<uint8_t>((mask >> 24) & 0xFF),
-                                0, 0, 0, 0, 0, 0, 0, 0 };
+        uint8_t payload[REQ_PAYLOAD_START_MEAS_SIZE] = {
+            REQ_FLAG_DEVICE_WIDE, REQ_SEL_START_MEAS,
+            static_cast<uint8_t>((mask >>  0) & 0xFF),
+            static_cast<uint8_t>((mask >>  8) & 0xFF),
+            static_cast<uint8_t>((mask >> 16) & 0xFF),
+            static_cast<uint8_t>((mask >> 24) & 0xFF),
+            0, 0, 0, 0, 0, 0, 0, 0
+        };
         uint8_t n = _impl->encode(buf, CMD_START_MEASUREMENTS,
                                   payload, sizeof(payload));
         if (!_impl->sendRequest(buf, n, REQUEST_TIMEOUT_MS)) {
@@ -741,9 +797,13 @@ bool GoGoVernier::stop() {
         _impl->streaming = false;
         return true;
     }
-    uint8_t buf[64];
-    // CMD_STOP_MEASUREMENTS — payload [0xFF][0x00][0xFF * 4].
-    uint8_t payload[6] = { 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF };
+    uint8_t buf[MAX_REQUEST_FRAME_SIZE];
+    // CMD_STOP_MEASUREMENTS — see REQ_PAYLOAD_STOP_MEAS_SIZE layout
+    // beside the constant in D2PIOProtocol.h.
+    uint8_t payload[REQ_PAYLOAD_STOP_MEAS_SIZE] = {
+        REQ_FLAG_DEVICE_WIDE, REQ_SEL_STOP_MEAS,
+        REQ_PAD_BYTE, REQ_PAD_BYTE, REQ_PAD_BYTE, REQ_PAD_BYTE
+    };
     uint8_t n = _impl->encode(buf, CMD_STOP_MEASUREMENTS, payload, sizeof(payload));
     bool ok = _impl->sendRequest(buf, n, REQUEST_TIMEOUT_MS);
     _impl->streaming = false;
@@ -755,6 +815,10 @@ bool GoGoVernier::isStreaming() const                 { return _impl->streaming;
 bool GoGoVernier::sampleReady() const                 { return _impl->sample_ready; }
 bool GoGoVernier::copySample(float* out, uint8_t& count) {
     if (!_impl->sample_ready) { count = 0; return false; }
+    // Pair with the producer-side fence in decodeMeasurement(): make
+    // sure we read the freshly-written channels[].value buffer, not a
+    // pre-flag-flip snapshot the compiler kept in a register.
+    VERNIER_CROSS_TASK_BARRIER();
     uint8_t idx = 0;
     for (uint8_t i = 0; i < MAX_CHANNELS; ++i) {
         if (_impl->enabled & (1u << i)) {
@@ -784,30 +848,22 @@ bool GoGoVernier::refreshStatus() {
     // require a round-trip to the device.
     _impl->status.rssi = static_cast<int8_t>(_impl->xport.rssi());
 
-    // CMD_GET_STATUS = 0x10 (godirect-py CMD_ID_GET_STATUS). Response
-    // layout (after the 6-byte frame header):
-    //   offset  6: status (B)
-    //   offset  7: spare  (B)
-    //   offset  8: primaryCpuMajor (B)
-    //   offset  9: primaryCpuMinor (B)
-    //   offset 10..11: primaryCpuBuild (u16 LE)
-    //   offset 12: secondaryCpuMajor (B)
-    //   offset 13: secondaryCpuMinor (B)
-    //   offset 14..15: secondaryCpuBuild (u16 LE)
-    //   offset 16: batteryLevelPercent (B)
-    //   offset 17: chargerState (B)
+    // CMD_GET_STATUS — full response body layout next to STATUS_OFF_*
+    // in D2PIOProtocol.h. We only need battery + charger today.
     uint8_t buf[FRAME_HEADER_SIZE];
     uint8_t n = _impl->encode(buf, CMD_GET_STATUS, nullptr, 0);
     if (!_impl->sendRequest(buf, n, REQUEST_TIMEOUT_MS)) {
         log_w("CMD_GET_STATUS timed out — keeping previous battery/charger");
         return false;
     }
-    if (_impl->resp_len < 18) {
+    if (_impl->resp_len < FRAME_BODY_OFFSET + STATUS_BODY_MIN_SIZE) {
         log_w("CMD_GET_STATUS short response (resp_len=%u)", _impl->resp_len);
         return false;
     }
-    _impl->status.battery_percent = _impl->resp_buf[16];
-    const uint8_t cs = _impl->resp_buf[17];
+    _impl->status.battery_percent =
+        _impl->resp_buf[FRAME_BODY_OFFSET + STATUS_OFF_BATTERY];
+    const uint8_t cs =
+        _impl->resp_buf[FRAME_BODY_OFFSET + STATUS_OFF_CHARGER];
     _impl->status.charger_state = (cs <= static_cast<uint8_t>(CHARGER_ERROR))
                                       ? static_cast<ChargerState>(cs)
                                       : CHARGER_ERROR;
